@@ -1,65 +1,126 @@
-import Image from "next/image";
+"use client";
 
-export default function Home() {
+import { useEffect, useState, useCallback } from "react";
+import PortfolioOverview from "@/components/PortfolioOverview";
+import AllocationChart from "@/components/AllocationChart";
+import TokenTable from "@/components/TokenTable";
+import AIAnalysis from "@/components/AIAnalysis";
+import type { PortfolioResponse, SnapshotsResponse, RawTokenBalance } from "@/lib/types";
+
+export default function Dashboard() {
+  const [portfolio, setPortfolio] = useState<PortfolioResponse | null>(null);
+  const [history, setHistory] = useState<SnapshotsResponse | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [lastUpdated, setLastUpdated] = useState<string>("");
+
+  const fetchData = useCallback(async () => {
+    setLoading(true);
+    try {
+      const [portRes, histRes] = await Promise.all([
+        fetch("/api/portfolio"),
+        fetch("/api/snapshots?from=" + new Date(Date.now() - 30 * 86400000).toISOString()),
+      ]);
+      if (portRes.ok) setPortfolio(await portRes.json());
+      if (histRes.ok) setHistory(await histRes.json());
+      setLastUpdated(new Date().toLocaleTimeString("cs-CZ"));
+    } catch (err) {
+      console.error("Failed to fetch portfolio:", err);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchData();
+  }, [fetchData]);
+
+  const allTokens: RawTokenBalance[] = portfolio?.wallets
+    .flatMap((w) => w.tokens)
+    .filter((t) => !t.is_derivative) ?? [];
+
+  const unknownCount = portfolio?.unknown_price_count ?? 0;
+
   return (
-    <div className="flex min-h-screen items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex min-h-screen w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.tsx file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
-        </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
+    <div className="space-y-5">
+      <div className="flex items-center justify-between">
+        <h1 className="text-xl font-bold text-white">Dashboard</h1>
+        <div className="flex items-center gap-3">
+          {lastUpdated && (
+            <span className="text-xs text-gray-500">
+              Aktualizováno: {lastUpdated}
+            </span>
+          )}
+          <button
+            onClick={fetchData}
+            disabled={loading}
+            className="px-3 py-1.5 text-sm bg-gray-800 hover:bg-gray-700 text-gray-300 rounded transition-colors disabled:opacity-50"
           >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
+            {loading ? "Načítám..." : "Obnovit"}
+          </button>
         </div>
-      </main>
+      </div>
+
+      {unknownCount > 0 && (
+        <div className="text-xs text-yellow-400/70 bg-yellow-900/20 border border-yellow-900/40 rounded px-3 py-2">
+          ⚠ {unknownCount} tokenů s neznámou cenou je vyloučeno z celkové hodnoty.
+        </div>
+      )}
+
+      <PortfolioOverview portfolio={portfolio} history={history} loading={loading} />
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+        <AllocationChart portfolio={portfolio} />
+
+        <div className="bg-gray-900 rounded-xl border border-gray-800 p-5">
+          <h2 className="font-semibold text-white mb-3">Peněženky</h2>
+          {loading ? (
+            <div className="space-y-2">
+              {[...Array(3)].map((_, i) => (
+                <div key={i} className="h-10 bg-gray-800 rounded animate-pulse" />
+              ))}
+            </div>
+          ) : !portfolio?.wallets.length ? (
+            <p className="text-gray-500 text-sm">
+              Žádné peněženky.{" "}
+              <a href="/wallets" className="text-indigo-400 hover:underline">
+                Přidej první peněženku →
+              </a>
+            </p>
+          ) : (
+            <div className="space-y-2">
+              {portfolio.wallets.map((w) => (
+                <div
+                  key={w.wallet.id}
+                  className="flex items-center justify-between py-2 border-b border-gray-800/50 last:border-0"
+                >
+                  <div>
+                    <div className="text-sm text-white">
+                      {w.wallet.label ?? "Peněženka " + w.wallet.id}
+                    </div>
+                    <div className="text-xs text-gray-500">
+                      {w.wallet.chain} · {w.wallet.address.slice(0, 10)}...
+                    </div>
+                  </div>
+                  <div className="text-right">
+                    <div className="text-sm font-medium text-white tabular-nums">
+                      ${w.total_usd.toLocaleString("cs-CZ", { maximumFractionDigits: 0 })}
+                    </div>
+                    {(w.defi_deposit_usd > 0 || w.defi_borrow_usd > 0) && (
+                      <div className="text-xs text-gray-500">
+                        DeFi net: ${(w.defi_deposit_usd - w.defi_borrow_usd).toLocaleString("cs-CZ", { maximumFractionDigits: 0 })}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+
+      <TokenTable tokens={allTokens} title={`Top tokeny (${allTokens.length})`} />
+
+      <AIAnalysis />
     </div>
   );
 }

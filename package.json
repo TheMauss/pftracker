@@ -6,12 +6,29 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "snapshot": "tsx scripts/take-snapshot.ts"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.78.0",
+    "@drift-labs/sdk": "^2.158.0-beta.3",
+    "@kamino-finance/klend-sdk": "^7.3.20",
+    "@mrgnlabs/marginfi-client-v2": "^6.4.1",
+    "@mrgnlabs/mrgn-common": "^2.0.7",
+    "@orca-so/whirlpools-sdk": "^0.20.0",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node-cron": "^3.0.11",
+    "better-sqlite3": "^12.6.2",
+    "date-fns": "^4.1.0",
+    "date-fns-tz": "^3.2.0",
     "next": "16.1.6",
+    "node-cron": "^4.2.1",
+    "p-limit": "^7.3.0",
     "react": "19.2.3",
-    "react-dom": "19.2.3"
+    "react-dom": "19.2.3",
+    "recharts": "^3.8.0",
+    "tsx": "^4.21.0",
+    "viem": "^2.47.1"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
