@@ -9,7 +9,7 @@ import { mainnet, base, arbitrum } from "viem/chains";
 
 const AAVE_DATA_PROVIDERS: Record<string, `0x${string}`> = {
   ethereum: "0x7B4EB56E7CD4b454BA8ff71E4518426369a138a3",
-  base: "0x2d8A3C5677189723C4cB8873CfC9C8976dfe498b",
+  base: "0x0F43731EB8d45A581f4a36DD74F5f358bc90C73A",
   arbitrum: "0x6b4E260b765B3cA1514e618C0215A6B7839fF93e",
 };
 
@@ -25,6 +25,16 @@ const CHAINS: Record<string, any> = {
   base,
   arbitrum,
 };
+
+function alchemyRpc(chain: string): string {
+  const key = process.env.ALCHEMY_API_KEY ?? "";
+  const prefix: Record<string, string> = {
+    ethereum: "eth-mainnet",
+    base: "base-mainnet",
+    arbitrum: "arb-mainnet",
+  };
+  return `https://${prefix[chain]}.g.alchemy.com/v2/${key}`;
+}
 
 const DATA_PROVIDER_ABI = parseAbi([
   "function getAllReservesTokens() external view returns ((string symbol, address tokenAddress)[])",
@@ -63,92 +73,56 @@ export async function fetchAavePositions(
 
   const client = createPublicClient({
     chain: viemChain,
-    transport: http(),
+    transport: http(alchemyRpc(chain)),
   });
 
   try {
+    // Batch 1: reserves list + baseCurrencyUnit (2 calls)
     const reserves = (await client.readContract({
       address: dataProvider,
       abi: DATA_PROVIDER_ABI,
       functionName: "getAllReservesTokens",
     })) as Array<{ symbol: string; tokenAddress: string }>;
 
-    const [userDataResults, reserveDataResults, decimalsResults, priceResults] =
-      await Promise.all([
-        Promise.all(
-          reserves.map((r) =>
-            client
-              .readContract({
-                address: dataProvider,
-                abi: DATA_PROVIDER_ABI,
-                functionName: "getUserReserveData",
-                args: [r.tokenAddress as `0x${string}`, walletAddress as `0x${string}`],
-              })
-              .catch(() => null)
-          )
-        ),
-        Promise.all(
-          reserves.map((r) =>
-            client
-              .readContract({
-                address: dataProvider,
-                abi: DATA_PROVIDER_ABI,
-                functionName: "getReserveData",
-                args: [r.tokenAddress as `0x${string}`],
-              })
-              .catch(() => null)
-          )
-        ),
-        Promise.all(
-          reserves.map((r) =>
-            client
-              .readContract({
-                address: r.tokenAddress as `0x${string}`,
-                abi: ERC20_ABI,
-                functionName: "decimals",
-              })
-              .catch(() => 18n)
-          )
-        ),
-        oracleAddr
-          ? Promise.all(
-              reserves.map((r) =>
-                client
-                  .readContract({
-                    address: oracleAddr,
-                    abi: ORACLE_ABI,
-                    functionName: "getAssetPrice",
-                    args: [r.tokenAddress as `0x${string}`],
-                  })
-                  .catch(() => 0n)
-              )
-            )
-          : Promise.resolve(reserves.map(() => 0n)),
-      ]);
-
     let baseCurrencyUnit = 10n ** 8n;
     if (oracleAddr) {
-      try {
-        baseCurrencyUnit = (await client.readContract({
-          address: oracleAddr,
-          abi: ORACLE_ABI,
-          functionName: "BASE_CURRENCY_UNIT",
-        })) as bigint;
-      } catch {
-        // default
-      }
+      try { baseCurrencyUnit = (await client.readContract({ address: oracleAddr, abi: ORACLE_ABI, functionName: "BASE_CURRENCY_UNIT" })) as bigint; } catch { /* default */ }
     }
 
+    if (reserves.length === 0) return positions;
+
+    // Batch 2: all per-reserve data in ONE multicall
+    type MC = { status: "success" | "failure"; result?: unknown };
+    const batch = (await client.multicall({
+      contracts: [
+        ...reserves.map((r) => ({ address: dataProvider, abi: DATA_PROVIDER_ABI, functionName: "getUserReserveData", args: [r.tokenAddress as `0x${string}`, walletAddress as `0x${string}`] })),
+        ...reserves.map((r) => ({ address: dataProvider, abi: DATA_PROVIDER_ABI, functionName: "getReserveData",     args: [r.tokenAddress as `0x${string}`] })),
+        ...reserves.map((r) => ({ address: r.tokenAddress as `0x${string}`, abi: ERC20_ABI, functionName: "decimals" })),
+        ...(oracleAddr ? reserves.map((r) => ({ address: oracleAddr, abi: ORACLE_ABI, functionName: "getAssetPrice", args: [r.tokenAddress as `0x${string}`] })) : []),
+      ],
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } as any)) as MC[];
+
+    const n = reserves.length;
+    const userDataResults   = batch.slice(0, n);
+    const reserveDataResults = batch.slice(n, 2 * n);
+    const decimalsResults   = batch.slice(2 * n, 3 * n);
+    const priceResults      = oracleAddr ? batch.slice(3 * n, 4 * n) : [];
+
     for (let i = 0; i < reserves.length; i++) {
-      const userData = userDataResults[i] as bigint[] | null;
+      const userEntry = userDataResults[i];
+      const userData = (userEntry?.status === "success" ? userEntry.result : null) as bigint[] | null;
       if (!userData) continue;
 
       const [currentATokenBalance, , currentVariableDebt] = userData;
-      const decimals = Number(decimalsResults[i] as bigint ?? 18n);
+      const decimalsEntry = decimalsResults[i];
+      const decimals = Number((decimalsEntry?.status === "success" ? decimalsEntry.result : 18n) as unknown as bigint);
       const divisor = 10n ** BigInt(decimals);
-      const priceRaw = priceResults[i] as bigint ?? 0n;
+      const priceEntry = priceResults[i];
+      const priceRaw = (priceEntry?.status === "success" ? priceEntry.result : 0n) as unknown as bigint ?? 0n;
       const priceUsd = priceRaw > 0n ? Number(priceRaw) / Number(baseCurrencyUnit) : null;
-      const reserveData = reserveDataResults[i] as bigint[] | null;
+      const reserveEntry = reserveDataResults[i];
+      const reserveData = (reserveEntry?.status === "success" ? reserveEntry.result : null) as bigint[] | null;
       const liquidityRate = (reserveData?.[5] ?? 0n) as bigint;
       const variableBorrowRate = (reserveData?.[6] ?? 0n) as bigint;
       const depositApy = rayToApy(liquidityRate);

@@ -16,7 +16,7 @@ function optionalEnv(key: string, fallback = ""): string {
 
 export const env = {
   HELIUS_API_KEY: requireEnv("HELIUS_API_KEY"),
-  COVALENT_API_KEY: requireEnv("COVALENT_API_KEY"),
+  ALCHEMY_API_KEY: requireEnv("ALCHEMY_API_KEY"),
   ANTHROPIC_API_KEY: optionalEnv("ANTHROPIC_API_KEY"),
   SNAPSHOT_SECRET: requireEnv("SNAPSHOT_SECRET"),
   DB_PATH: optionalEnv("DB_PATH", "./data/portfolio.db"),

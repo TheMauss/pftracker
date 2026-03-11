@@ -89,7 +89,7 @@ export async function fetchGmxPositions(
 
     const client = createPublicClient({
       chain: arbitrum,
-      transport: http(),
+      transport: http(`https://arb-mainnet.g.alchemy.com/v2/${process.env.ALCHEMY_API_KEY ?? ""}`),
     });
 
     const ERC20_ABI = parseAbi([

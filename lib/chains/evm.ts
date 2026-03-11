@@ -1,20 +1,42 @@
 /**
- * Fetches EVM wallet token balances via Covalent multi-chain API.
+ * Fetches EVM wallet token balances via Alchemy API.
  * Covers: Ethereum, Base, Arbitrum, BNB Chain.
  * HyperEVM native balance fetched via viem.
  */
 
 import type { RawTokenBalance, ChainId } from "../types";
 import { createPublicClient, http, formatEther } from "viem";
+import { getCoinGeckoPrices } from "../prices";
 
-const COVALENT_BASE = "https://api.covalenthq.com/v1";
-
-const CHAIN_MAP: Record<string, string> = {
+// BSC not supported by Alchemy - excluded
+const ALCHEMY_CHAIN: Record<string, string> = {
   ethereum: "eth-mainnet",
   base: "base-mainnet",
-  arbitrum: "arbitrum-mainnet",
-  bsc: "bsc-mainnet",
+  arbitrum: "arb-mainnet",
 };
+
+const NATIVE: Record<string, { symbol: string; name: string; address: string }> = {
+  ethereum: { symbol: "ETH", name: "Ether", address: "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" },
+  base: { symbol: "ETH", name: "Ether", address: "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" },
+  arbitrum: { symbol: "ETH", name: "Ether", address: "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" },
+  bsc: { symbol: "BNB", name: "BNB", address: "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" },
+};
+
+function alchemyUrl(chain: string): string {
+  const key = process.env.ALCHEMY_API_KEY ?? "";
+  return `https://${ALCHEMY_CHAIN[chain]}.g.alchemy.com/v2/${key}`;
+}
+
+async function alchemyCall(chain: string, method: string, params: unknown[]) {
+  const res = await fetch(alchemyUrl(chain), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", method, params, id: 1 }),
+    signal: AbortSignal.timeout(20_000),
+  });
+  if (!res.ok) throw new Error(`Alchemy ${chain}/${method}: ${res.status}`);
+  return res.json();
+}
 
 const hyperEvmChain = {
   id: 999,
@@ -77,54 +99,86 @@ export async function fetchEvmBalances(
   chain: ChainId
 ): Promise<RawTokenBalance[]> {
   if (chain === "hyperevm") return fetchHyperEvmBalances(walletAddress);
-
-  const covalentChain = CHAIN_MAP[chain];
-  if (!covalentChain) return [];
-
-  const apiKey = process.env.COVALENT_API_KEY ?? "";
+  if (!ALCHEMY_CHAIN[chain]) return [];
 
   try {
-    const url = `${COVALENT_BASE}/${covalentChain}/address/${walletAddress}/balances_v2/?key=${apiKey}&no-spam=true&no-nft-fetch=true`;
-    const res = await fetch(url, {
-      headers: { Accept: "application/json" },
-      signal: AbortSignal.timeout(20_000),
-    });
+    // 1. ERC20 balances (1 call) + native balance (1 call) in parallel
+    const [balJson, nativeHex] = await Promise.all([
+      alchemyCall(chain, "alchemy_getTokenBalances", [walletAddress, "erc20"]),
+      alchemyCall(chain, "eth_getBalance", [walletAddress, "latest"]),
+    ]);
 
-    if (!res.ok) {
-      console.error(`Covalent error for ${chain}/${walletAddress}: ${res.status}`);
-      return [];
+    const rawBalances: { contractAddress: string; tokenBalance: string }[] =
+      (balJson?.result?.tokenBalances ?? []).filter(
+        (t: { tokenBalance: string }) =>
+          t.tokenBalance && t.tokenBalance !== "0x0000000000000000000000000000000000000000000000000000000000000000"
+      );
+
+    const nativeAmount = parseFloat(formatEther(BigInt(nativeHex?.result ?? "0x0")));
+
+    // 2. Metadata for all tokens in ONE JSON-RPC batch HTTP request
+    const metaMap = new Map<string, { symbol: string; name: string; decimals: number }>();
+    if (rawBalances.length > 0) {
+      const batchBody = rawBalances.map((t, i) => ({
+        jsonrpc: "2.0",
+        method: "alchemy_getTokenMetadata",
+        params: [t.contractAddress],
+        id: i,
+      }));
+      const res = await fetch(alchemyUrl(chain), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(batchBody),
+        signal: AbortSignal.timeout(20_000),
+      });
+      if (res.ok) {
+        const batchResults = await res.json() as Array<{ id: number; result?: { symbol: string; name: string; decimals: number } }>;
+        for (const r of batchResults) {
+          if (r.result) metaMap.set(rawBalances[r.id].contractAddress.toLowerCase(), r.result);
+        }
+      }
     }
 
-    const json = await res.json();
-    const items: CovalentItem[] = json?.data?.items ?? [];
+    // 3. Prices via CoinGecko (one batch)
+    const contractAddrs = rawBalances.map((t) => t.contractAddress);
+    const nativeToken = NATIVE[chain];
+    if (nativeAmount > 0.0001) contractAddrs.push(nativeToken.address);
+    const prices = await getCoinGeckoPrices(contractAddrs, chain);
 
     const tokens: RawTokenBalance[] = [];
 
-    for (const item of items) {
-      // Skip NFTs and zero balances
-      if (item.type === "nft") continue;
-      if (!item.balance || item.balance === "0") continue;
+    // Native token
+    if (nativeAmount > 0.0001) {
+      const priceUsd = prices.get(nativeToken.address) ?? null;
+      tokens.push({
+        token_symbol: nativeToken.symbol,
+        token_name: nativeToken.name,
+        token_address: "native",
+        chain,
+        amount: nativeAmount,
+        price_usd: priceUsd,
+        value_usd: priceUsd ? nativeAmount * priceUsd : 0,
+      });
+    }
 
-      const decimals = item.contract_decimals ?? 18;
-      const amount = Number(BigInt(item.balance)) / Math.pow(10, decimals);
+    // ERC20 tokens
+    for (const raw of rawBalances) {
+      const meta = metaMap.get(raw.contractAddress.toLowerCase());
+      if (!meta) continue;
+
+      const decimals = meta.decimals ?? 18;
+      const amount = Number(BigInt(raw.tokenBalance)) / Math.pow(10, decimals);
       if (amount <= 0) continue;
 
-      const priceUsd =
-        item.quote_rate && item.quote_rate > 0 ? item.quote_rate : null;
-      const valueUsd =
-        item.quote && item.quote > 0
-          ? item.quote
-          : priceUsd
-          ? amount * priceUsd
-          : 0;
+      const priceUsd = prices.get(raw.contractAddress.toLowerCase()) ?? null;
+      const valueUsd = priceUsd ? amount * priceUsd : 0;
 
-      // Filter dust
       if (valueUsd < 0.01 && priceUsd !== null) continue;
 
       tokens.push({
-        token_symbol: item.contract_ticker_symbol ?? "UNKNOWN",
-        token_name: item.contract_name ?? null,
-        token_address: item.contract_address ?? null,
+        token_symbol: meta.symbol ?? "UNKNOWN",
+        token_name: meta.name ?? null,
+        token_address: raw.contractAddress,
         chain,
         amount,
         price_usd: priceUsd,
@@ -137,15 +191,4 @@ export async function fetchEvmBalances(
     console.error(`Failed to fetch EVM balances for ${chain}/${walletAddress}:`, err);
     return [];
   }
-}
-
-interface CovalentItem {
-  contract_decimals: number;
-  contract_name: string;
-  contract_ticker_symbol: string;
-  contract_address: string;
-  balance: string;
-  quote_rate: number | null;
-  quote: number | null;
-  type: string;
 }

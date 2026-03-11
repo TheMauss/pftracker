@@ -1,45 +1,56 @@
 /**
- * Fetches Drift Protocol positions via the Drift data API.
- * Covers: perp positions, spot borrows/lends.
- * https://data.api.drift.trade
+ * Fetches Drift Protocol positions via the Drift Data API.
+ * https://data.api.drift.trade/playground
+ *
+ * Step 1: GET /authority/{wallet}/accounts → list of account IDs
+ * Step 2: GET /authority/{wallet}/snapshots/overview → current positions overview
  */
 
 import type { RawDefiPosition } from "../types";
 
 const DRIFT_API = "https://data.api.drift.trade";
 
-interface DriftPosition {
-  marketIndex: number;
-  marketName: string;
-  baseAssetAmount: number;
-  quoteAssetAmount: number;
-  entryPrice: number;
-  markPrice: number;
-  unrealizedPnl: number;
-  unsettledPnl: number;
-  side: "long" | "short";
-  leverage: number;
-  liquidationPrice: number;
-  notionalValue: number;
-  availableCollateral: number;
+interface DriftAccount {
+  accountId: string;
+  subAccountId: number;
+  name: string;
 }
 
-interface DriftSpotPosition {
+interface DriftTradeProduct {
   marketIndex: number;
-  marketName: string;
-  tokenAmount: number;
-  tokenAmountUSD: number;
-  isDebt: boolean;
+  marketSymbol: string;
+  direction: string; // "long" | "short"
+  notional: number;
+  entryPrice: number;
+  oraclePrice: number;
+  pnl: number;
+  fundingAllTime: number;
+  baseAssetAmount: number;
+}
+
+interface DriftEarnProduct {
+  marketIndex: number;
+  marketSymbol: string;
+  currentDeposit: number;
+  currentBorrow: number;
   depositApy: number;
   borrowApy: number;
+  netApy: number;
+  netUsdValue: number;
 }
 
-interface DriftUserResponse {
-  perpPositions: DriftPosition[];
-  spotPositions: DriftSpotPosition[];
-  totalCollateral: number;
-  freeCollateral: number;
-  unrealizedPnl: number;
+interface DriftOverview {
+  success: boolean;
+  products: {
+    trade: DriftTradeProduct[];
+    earn: DriftEarnProduct[];
+    vaults: Array<{
+      vaultName: string;
+      vaultAddress: string;
+      equity: number;
+      pnl: number;
+    }>;
+  };
 }
 
 export async function fetchDriftPositions(
@@ -47,62 +58,104 @@ export async function fetchDriftPositions(
 ): Promise<RawDefiPosition[]> {
   const positions: RawDefiPosition[] = [];
 
-  // Try multiple subaccounts (0-3)
-  for (let subAccountId = 0; subAccountId <= 3; subAccountId++) {
-    try {
-      const url = `${DRIFT_API}/v2/positions?userPublicKey=${walletAddress}&subAccountId=${subAccountId}`;
-      const res = await fetch(url, { headers: { Accept: "application/json" } });
-      if (!res.ok) break;
+  try {
+    // Step 1: Check if wallet has any Drift accounts
+    const accountsRes = await fetch(
+      `${DRIFT_API}/authority/${walletAddress}/accounts`,
+      { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(15_000) }
+    );
+    if (!accountsRes.ok) return positions;
 
-      const data: DriftUserResponse = await res.json();
-      if (!data) continue;
+    const accountsData = await accountsRes.json();
+    const accounts: DriftAccount[] = accountsData?.accounts ?? [];
+    if (accounts.length === 0) return positions;
 
-      // Spot positions (lends and borrows)
-      for (const spot of data.spotPositions ?? []) {
-        if (!spot.tokenAmountUSD || Math.abs(spot.tokenAmountUSD) <= 0.01) continue;
+    // Step 2: Get overview snapshot (covers all sub-accounts)
+    const overviewRes = await fetch(
+      `${DRIFT_API}/authority/${walletAddress}/snapshots/overview`,
+      { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(15_000) }
+    );
+    if (!overviewRes.ok) return positions;
+
+    const overview: DriftOverview = await overviewRes.json();
+    if (!overview.success) return positions;
+
+    // Earn products (spot deposits/borrows)
+    for (const earn of overview.products.earn ?? []) {
+      if (earn.currentDeposit > 0.01) {
         positions.push({
           protocol: "drift",
           chain: "solana",
-          position_type: spot.isDebt ? "borrow" : "lend",
-          asset_symbol: spot.marketName ?? `SPOT-${spot.marketIndex}`,
-          amount: Math.abs(spot.tokenAmount),
-          price_usd:
-            spot.tokenAmount !== 0
-              ? Math.abs(spot.tokenAmountUSD / spot.tokenAmount)
-              : null,
-          value_usd: Math.abs(spot.tokenAmountUSD),
-          is_debt: spot.isDebt,
-          apy: spot.isDebt
-            ? -(spot.borrowApy ?? null)
-            : (spot.depositApy ?? null),
-          extra_data: { subAccount: subAccountId },
-        });
-      }
-
-      // Perp positions
-      for (const perp of data.perpPositions ?? []) {
-        if (!perp.notionalValue || Math.abs(perp.notionalValue) <= 0.01) continue;
-        positions.push({
-          protocol: "drift",
-          chain: "solana",
-          position_type: "perp",
-          asset_symbol: `${perp.marketName}-PERP`,
-          amount: Math.abs(perp.baseAssetAmount),
-          price_usd: perp.markPrice ?? null,
-          value_usd: perp.unrealizedPnl ?? 0,
+          position_type: "lend",
+          asset_symbol: earn.marketSymbol ?? `SPOT-${earn.marketIndex}`,
+          amount: earn.currentDeposit,
+          price_usd: earn.netUsdValue > 0 && earn.currentDeposit > 0
+            ? earn.netUsdValue / earn.currentDeposit
+            : null,
+          value_usd: Math.abs(earn.netUsdValue),
           is_debt: false,
-          apy: null,
-          extra_data: {
-            side: perp.side,
-            leverage: perp.leverage,
-            unrealizedPnl: perp.unrealizedPnl,
-            subAccount: subAccountId,
-          },
+          apy: earn.depositApy ?? null,
         });
       }
-    } catch {
-      break;
+
+      if (earn.currentBorrow > 0.01) {
+        positions.push({
+          protocol: "drift",
+          chain: "solana",
+          position_type: "borrow",
+          asset_symbol: earn.marketSymbol ?? `SPOT-${earn.marketIndex}`,
+          amount: earn.currentBorrow,
+          price_usd: null,
+          value_usd: Math.abs(earn.netUsdValue),
+          is_debt: true,
+          apy: earn.borrowApy ? -earn.borrowApy : null,
+        });
+      }
     }
+
+    // Trade products (perp positions)
+    for (const trade of overview.products.trade ?? []) {
+      const notional = Math.abs(trade.notional ?? 0);
+      if (notional <= 0.01) continue;
+
+      positions.push({
+        protocol: "drift",
+        chain: "solana",
+        position_type: "perp",
+        asset_symbol: `${trade.marketSymbol}-PERP`,
+        amount: Math.abs(trade.baseAssetAmount ?? 0),
+        price_usd: trade.oraclePrice ?? null,
+        value_usd: trade.pnl ?? 0,
+        is_debt: false,
+        apy: null,
+        extra_data: {
+          side: trade.direction,
+          notional,
+          entryPrice: trade.entryPrice,
+          pnl: trade.pnl,
+          fundingAllTime: trade.fundingAllTime,
+        },
+      });
+    }
+
+    // Vault positions
+    for (const vault of overview.products.vaults ?? []) {
+      if (Math.abs(vault.equity ?? 0) <= 0.01) continue;
+      positions.push({
+        protocol: "drift",
+        chain: "solana",
+        position_type: "vault",
+        asset_symbol: vault.vaultName ?? "DRIFT-VAULT",
+        amount: vault.equity,
+        price_usd: 1.0,
+        value_usd: vault.equity,
+        is_debt: false,
+        apy: null,
+        extra_data: { vaultAddress: vault.vaultAddress, pnl: vault.pnl },
+      });
+    }
+  } catch (err) {
+    console.error("Drift fetch error:", err);
   }
 
   return positions;

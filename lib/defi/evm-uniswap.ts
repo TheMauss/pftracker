@@ -28,6 +28,16 @@ const CHAINS: Record<string, any> = {
   arbitrum,
 };
 
+function alchemyRpc(chain: string): string {
+  const key = process.env.ALCHEMY_API_KEY ?? "";
+  const prefix: Record<string, string> = {
+    ethereum: "eth-mainnet",
+    base: "base-mainnet",
+    arbitrum: "arb-mainnet",
+  };
+  return `https://${prefix[chain]}.g.alchemy.com/v2/${key}`;
+}
+
 const POSITION_MANAGER_ABI = parseAbi([
   "function balanceOf(address owner) external view returns (uint256)",
   "function tokenOfOwnerByIndex(address owner, uint256 index) external view returns (uint256)",
@@ -52,7 +62,7 @@ export async function fetchUniswapPositions(
 
   const client = createPublicClient({
     chain: viemChain,
-    transport: http(),
+    transport: http(alchemyRpc(chain)),
   });
 
   try {

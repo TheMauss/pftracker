@@ -1,18 +1,17 @@
 /**
  * Fetches Hyperlend positions on HyperEVM (chain 999).
  * Hyperlend is an Aave V3 fork.
- * Uses viem to read from the ProtocolDataProvider contract.
+ * Uses viem multicall to batch all RPC calls into one request.
  */
 
 import type { RawDefiPosition } from "../types";
-import { createPublicClient, http, parseAbi } from "viem";
+import { createPublicClient, http, parseAbi, defineChain } from "viem";
 
 const HYPEREVM_RPC = "https://rpc.hyperliquid.xyz/evm";
 const CHAIN_ID = 999;
 
-// Hyperlend contract addresses on HyperEVM
 const PROTOCOL_DATA_PROVIDER = "0x5481bf8d3946E6A3168640c1D7523eB59F055a29" as const;
-const POOL_ADDRESS_PROVIDER = "0x72c98246a98bFe64022a3190e7710E157497170C" as const;
+const ORACLE_ADDRESS = "0xC9Fb4fbE842d57EAc1dF3e641a281827493A630e" as const;
 
 const DATA_PROVIDER_ABI = parseAbi([
   "function getAllReservesTokens() external view returns ((string symbol, address tokenAddress)[])",
@@ -22,33 +21,58 @@ const DATA_PROVIDER_ABI = parseAbi([
 
 const ERC20_ABI = parseAbi([
   "function decimals() external view returns (uint8)",
-  "function symbol() external view returns (string)",
 ]);
 
-// Simple oracle ABI for price (Aave uses Chainlink oracles)
 const ORACLE_ABI = parseAbi([
   "function getAssetPrice(address asset) external view returns (uint256)",
   "function BASE_CURRENCY_UNIT() external view returns (uint256)",
 ]);
 
-const ORACLE_ADDRESS = "0xC9Fb4fbE842d57EAc1dF3e641a281827493A630e" as const;
-
-// Ray = 1e27 for interest rate calculations
 const RAY = 10n ** 27n;
 const SECONDS_PER_YEAR = 31536000n;
 
 function rayToApy(rayRate: bigint): number {
-  // APY = (1 + rate/SECONDS_PER_YEAR)^SECONDS_PER_YEAR - 1 (approximation)
   const ratePerSecond = Number(rayRate) / Number(RAY) / Number(SECONDS_PER_YEAR);
   return (Math.pow(1 + ratePerSecond, Number(SECONDS_PER_YEAR)) - 1) * 100;
 }
 
-const hyperevmChain = {
+const hyperevmChain = defineChain({
   id: CHAIN_ID,
   name: "HyperEVM",
   nativeCurrency: { name: "HYPE", symbol: "HYPE", decimals: 18 },
   rpcUrls: { default: { http: [HYPEREVM_RPC] } },
-} as const;
+  contracts: {
+    multicall3: { address: "0xcA11bde05977b3631167028862bE2a173976CA11" },
+  },
+});
+
+const HYPE_RATIO: Record<string, number> = {
+  HYPE: 1.0,
+  wstHYPE: 1.0,
+  kHYPE: 1.0,
+  stHYPE: 1.0,
+};
+
+async function fetchHypePrice(): Promise<number | null> {
+  try {
+    const res = await fetch("https://api.hyperliquid.xyz/info", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ type: "spotMetaAndAssetCtxs" }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) return null;
+    const [meta, ctxs] = (await res.json()) as [
+      { universe: Array<{ name: string }> },
+      Array<{ coin: string; markPx: string }>
+    ];
+    void meta;
+    for (const ctx of ctxs) {
+      if (ctx.coin === "HYPE/USDC" && ctx.markPx) return parseFloat(ctx.markPx);
+    }
+  } catch {}
+  return null;
+}
 
 export async function fetchHyperlendPositions(
   walletAddress: string
@@ -57,117 +81,72 @@ export async function fetchHyperlendPositions(
 
   const client = createPublicClient({
     chain: hyperevmChain,
-    transport: http(HYPEREVM_RPC),
+    transport: http(HYPEREVM_RPC, { timeout: 30_000, retryCount: 2, retryDelay: 1_000 }),
   });
 
   try {
-    // Get all reserve tokens
-    const reserves = await client.readContract({
+    // Call 1: get reserves list
+    const reserves = (await client.readContract({
       address: PROTOCOL_DATA_PROVIDER,
       abi: DATA_PROVIDER_ABI,
       functionName: "getAllReservesTokens",
+    })) as Array<{ symbol: string; tokenAddress: string }>;
+
+    if (reserves.length === 0) return positions;
+
+    // Call 2: ONE multicall with all per-reserve data + baseCurrencyUnit
+    type MC = { status: "success" | "failure"; result?: unknown };
+    const batch = (await client.multicall({
+      contracts: [
+        { address: ORACLE_ADDRESS, abi: ORACLE_ABI, functionName: "BASE_CURRENCY_UNIT" },
+        ...reserves.map((r) => ({ address: PROTOCOL_DATA_PROVIDER, abi: DATA_PROVIDER_ABI, functionName: "getUserReserveData" as const, args: [r.tokenAddress as `0x${string}`, walletAddress as `0x${string}`] })),
+        ...reserves.map((r) => ({ address: PROTOCOL_DATA_PROVIDER, abi: DATA_PROVIDER_ABI, functionName: "getReserveData" as const, args: [r.tokenAddress as `0x${string}`] })),
+        ...reserves.map((r) => ({ address: r.tokenAddress as `0x${string}`, abi: ERC20_ABI, functionName: "decimals" as const })),
+        ...reserves.map((r) => ({ address: ORACLE_ADDRESS, abi: ORACLE_ABI, functionName: "getAssetPrice" as const, args: [r.tokenAddress as `0x${string}`] })),
+      ],
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } as any)) as MC[];
+
+    const n = reserves.length;
+    const baseCurrencyEntry = batch[0];
+    const baseCurrencyUnit = (baseCurrencyEntry?.status === "success" ? baseCurrencyEntry.result : 10n ** 8n) as bigint ?? 10n ** 8n;
+    const userDataResults   = batch.slice(1,         1 + n);
+    const reserveDataResults = batch.slice(1 + n,    1 + 2 * n);
+    const decimalsResults   = batch.slice(1 + 2 * n, 1 + 3 * n);
+    const priceResults      = batch.slice(1 + 3 * n, 1 + 4 * n);
+
+    // Fetch HYPE price if needed
+    const needsHype = reserves.some((r, i) => {
+      const priceEntry = priceResults[i];
+      const price = (priceEntry?.status === "success" ? priceEntry.result : 0n) as bigint;
+      return (!price || price === 0n) && HYPE_RATIO[r.symbol] !== undefined;
     });
+    const hypePrice = needsHype ? await fetchHypePrice() : null;
 
-    // Batch fetch user data for all reserves
-    const userDataPromises = (reserves as Array<{ symbol: string; tokenAddress: string }>).map(
-      (reserve) =>
-        client
-          .readContract({
-            address: PROTOCOL_DATA_PROVIDER,
-            abi: DATA_PROVIDER_ABI,
-            functionName: "getUserReserveData",
-            args: [reserve.tokenAddress as `0x${string}`, walletAddress as `0x${string}`],
-          })
-          .catch(() => null)
-    );
-
-    // Batch fetch reserve data for APYs
-    const reserveDataPromises = (reserves as Array<{ symbol: string; tokenAddress: string }>).map(
-      (reserve) =>
-        client
-          .readContract({
-            address: PROTOCOL_DATA_PROVIDER,
-            abi: DATA_PROVIDER_ABI,
-            functionName: "getReserveData",
-            args: [reserve.tokenAddress as `0x${string}`],
-          })
-          .catch(() => null)
-    );
-
-    // Batch fetch decimals
-    const decimalsPromises = (reserves as Array<{ symbol: string; tokenAddress: string }>).map(
-      (reserve) =>
-        client
-          .readContract({
-            address: reserve.tokenAddress as `0x${string}`,
-            abi: ERC20_ABI,
-            functionName: "decimals",
-          })
-          .catch(() => 18n)
-    );
-
-    // Fetch oracle prices
-    const pricePromises = (reserves as Array<{ symbol: string; tokenAddress: string }>).map(
-      (reserve) =>
-        client
-          .readContract({
-            address: ORACLE_ADDRESS,
-            abi: ORACLE_ABI,
-            functionName: "getAssetPrice",
-            args: [reserve.tokenAddress as `0x${string}`],
-          })
-          .catch(() => 0n)
-    );
-
-    const [userDataResults, reserveDataResults, decimalsResults, priceResults] =
-      await Promise.all([
-        Promise.all(userDataPromises),
-        Promise.all(reserveDataPromises),
-        Promise.all(decimalsPromises),
-        Promise.all(pricePromises),
-      ]);
-
-    // Oracle base currency unit (usually 1e8 for USD)
-    let baseCurrencyUnit = 10n ** 8n;
-    try {
-      baseCurrencyUnit = await client.readContract({
-        address: ORACLE_ADDRESS,
-        abi: ORACLE_ABI,
-        functionName: "BASE_CURRENCY_UNIT",
-      }) as bigint;
-    } catch {
-      // default to 1e8
-    }
-
-    const reserveList = reserves as Array<{ symbol: string; tokenAddress: string }>;
-
-    for (let i = 0; i < reserveList.length; i++) {
-      const userData = userDataResults[i];
+    for (let i = 0; i < reserves.length; i++) {
+      const userEntry = userDataResults[i];
+      const userData = (userEntry?.status === "success" ? userEntry.result : null) as bigint[] | null;
       if (!userData) continue;
 
-      const [
-        currentATokenBalance,
-        ,
-        currentVariableDebt,
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      ] = userData as any as bigint[];
-
-      const decimals = Number(decimalsResults[i] ?? 18n);
+      const [currentATokenBalance, , currentVariableDebt] = userData;
+      const decimalsEntry = decimalsResults[i];
+      const decimals = Number((decimalsEntry?.status === "success" ? decimalsEntry.result : 18n) as unknown as bigint);
       const divisor = 10n ** BigInt(decimals);
 
-      const priceRaw = priceResults[i] as bigint ?? 0n;
-      const priceUsd =
-        priceRaw > 0n
-          ? Number(priceRaw) / Number(baseCurrencyUnit)
-          : null;
+      const priceEntry = priceResults[i];
+      const priceRaw = (priceEntry?.status === "success" ? priceEntry.result : 0n) as unknown as bigint ?? 0n;
+      let priceUsd: number | null = priceRaw > 0n ? Number(priceRaw) / Number(baseCurrencyUnit) : null;
+      if (!priceUsd && hypePrice && HYPE_RATIO[reserves[i].symbol] !== undefined) {
+        priceUsd = hypePrice * HYPE_RATIO[reserves[i].symbol];
+      }
 
-      const reserveData = reserveDataResults[i] as bigint[] | null;
-      const liquidityRate = reserveData?.[5] ?? 0n;
-      const variableBorrowRate = reserveData?.[6] ?? 0n;
-      const depositApy = rayToApy(liquidityRate as bigint);
-      const borrowApy = rayToApy(variableBorrowRate as bigint);
+      const reserveEntry = reserveDataResults[i];
+      const reserveData = (reserveEntry?.status === "success" ? reserveEntry.result : null) as bigint[] | null;
+      const liquidityRate = (reserveData?.[5] ?? 0n) as bigint;
+      const variableBorrowRate = (reserveData?.[6] ?? 0n) as bigint;
+      const depositApy = rayToApy(liquidityRate);
+      const borrowApy = rayToApy(variableBorrowRate);
 
-      // Deposits
       if ((currentATokenBalance as bigint) > 0n) {
         const amount = Number(currentATokenBalance as bigint) / Number(divisor);
         const valueUsd = priceUsd ? amount * priceUsd : 0;
@@ -176,8 +155,8 @@ export async function fetchHyperlendPositions(
             protocol: "hyperlend",
             chain: "hyperevm",
             position_type: "lend",
-            asset_symbol: reserveList[i].symbol,
-            asset_address: reserveList[i].tokenAddress,
+            asset_symbol: reserves[i].symbol,
+            asset_address: reserves[i].tokenAddress,
             amount,
             price_usd: priceUsd,
             value_usd: valueUsd,
@@ -187,7 +166,6 @@ export async function fetchHyperlendPositions(
         }
       }
 
-      // Variable borrows
       if ((currentVariableDebt as bigint) > 0n) {
         const amount = Number(currentVariableDebt as bigint) / Number(divisor);
         const valueUsd = priceUsd ? amount * priceUsd : 0;
@@ -196,8 +174,8 @@ export async function fetchHyperlendPositions(
             protocol: "hyperlend",
             chain: "hyperevm",
             position_type: "borrow",
-            asset_symbol: reserveList[i].symbol,
-            asset_address: reserveList[i].tokenAddress,
+            asset_symbol: reserves[i].symbol,
+            asset_address: reserves[i].tokenAddress,
             amount,
             price_usd: priceUsd,
             value_usd: valueUsd,

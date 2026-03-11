@@ -58,6 +58,7 @@ interface HLSpotMeta {
 }
 
 interface HLSpotAssetCtx {
+  coin: string;
   markPx: string;
   midPx: string | null;
   dayNtlVlm: string;
@@ -90,14 +91,21 @@ async function fetchSpotPrices(): Promise<Map<number, number>> {
     });
     if (!res.ok) return prices;
     const [meta, ctxs] = (await res.json()) as [HLSpotMeta, HLSpotAssetCtx[]];
-    for (let i = 0; i < meta.universe.length; i++) {
-      const market = meta.universe[i];
-      const ctx = ctxs[i];
-      if (!ctx?.markPx) continue;
+
+    // Build map: market name → base token index
+    const nameToBaseToken = new Map<string, number>();
+    for (const market of meta.universe) {
+      nameToBaseToken.set(market.name, market.tokens[0]);
+    }
+
+    // Match ctxs by coin name (ctxs array may differ in length from universe)
+    for (const ctx of ctxs) {
+      if (!ctx?.markPx || !ctx.coin) continue;
+      const baseToken = nameToBaseToken.get(ctx.coin);
+      if (baseToken === undefined) continue;
       const price = parseFloat(ctx.markPx);
       if (!isNaN(price) && price > 0) {
-        // tokens[0] = base token index, tokens[1] = quote token index
-        prices.set(market.tokens[0], price);
+        prices.set(baseToken, price);
       }
     }
   } catch {}

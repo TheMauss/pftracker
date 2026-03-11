@@ -23,40 +23,40 @@ const SOL_MINT = "So11111111111111111111111111111111111111112";
 export async function fetchSolanaBalances(
   walletAddress: string
 ): Promise<RawTokenBalance[]> {
-  const [tokens, solBalance] = await Promise.all([
+  const [tokens, solData] = await Promise.all([
     fetchFungibleTokens(walletAddress),
-    fetchNativeSol(walletAddress),
+    fetchNativeSolWithPrice(walletAddress),
   ]);
 
   const allTokens = [...tokens];
 
   // Add native SOL if balance > 0
-  if (solBalance > 0) {
+  if (solData.balance > 0) {
     allTokens.push({
       token_symbol: "SOL",
       token_name: "Solana",
       token_address: SOL_MINT,
       chain: "solana",
-      amount: solBalance,
-      price_usd: null,
-      value_usd: 0,
+      amount: solData.balance,
+      price_usd: solData.priceUsd,
+      value_usd: solData.priceUsd ? solData.balance * solData.priceUsd : 0,
     });
   }
 
-  // Resolve prices for all tokens via Jupiter
-  const mints = allTokens
-    .filter((t) => t.token_address)
+  // Try to resolve missing prices via Jupiter (best-effort, may 401)
+  const unpriced = allTokens
+    .filter((t) => !t.price_usd && t.token_address)
     .map((t) => t.token_address!);
 
-  const prices = await getJupiterPrices([...new Set(mints)]);
-
-  // Apply prices
-  for (const token of allTokens) {
-    if (!token.price_usd && token.token_address) {
-      const price = prices.get(token.token_address);
-      if (price !== undefined) {
-        token.price_usd = price;
-        token.value_usd = token.amount * price;
+  if (unpriced.length > 0) {
+    const prices = await getJupiterPrices([...new Set(unpriced)]);
+    for (const token of allTokens) {
+      if (!token.price_usd && token.token_address) {
+        const price = prices.get(token.token_address);
+        if (price !== undefined) {
+          token.price_usd = price;
+          token.value_usd = token.amount * price;
+        }
       }
     }
   }
@@ -67,7 +67,50 @@ export async function fetchSolanaBalances(
   );
 }
 
-async function fetchNativeSol(address: string): Promise<number> {
+async function fetchNativeSolWithPrice(
+  address: string
+): Promise<{ balance: number; priceUsd: number | null }> {
+  try {
+    // Use Helius DAS to get native balance + SOL price in one call
+    const res = await fetch(HELIUS_DAS, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: "native-sol",
+        method: "getAssetsByOwner",
+        params: {
+          ownerAddress: address,
+          page: 1,
+          limit: 1,
+          displayOptions: {
+            showFungible: false,
+            showNativeBalance: true,
+            showZeroBalance: false,
+          },
+        },
+      }),
+      signal: AbortSignal.timeout(15_000),
+    });
+    const json = await res.json();
+    const nativeBalance = json?.result?.nativeBalance;
+    if (nativeBalance) {
+      const lamports = nativeBalance.lamports ?? 0;
+      const pricePerSol = nativeBalance.price_per_sol ?? null;
+      return {
+        balance: lamports / 1e9,
+        priceUsd: pricePerSol,
+      };
+    }
+
+    // Fallback to getBalance RPC (no price)
+    return { balance: await fetchBalanceRpc(address), priceUsd: null };
+  } catch {
+    return { balance: 0, priceUsd: null };
+  }
+}
+
+async function fetchBalanceRpc(address: string): Promise<number> {
   try {
     const res = await fetch(HELIUS_RPC, {
       method: "POST",
@@ -81,8 +124,7 @@ async function fetchNativeSol(address: string): Promise<number> {
       signal: AbortSignal.timeout(15_000),
     });
     const json = await res.json();
-    const lamports = json?.result?.value ?? 0;
-    return lamports / 1e9;
+    return (json?.result?.value ?? 0) / 1e9;
   } catch {
     return 0;
   }

@@ -1,29 +1,73 @@
 /**
  * Fetches Kamino lending positions (deposits + borrows) via Kamino REST API.
  * https://api.kamino.finance/
+ *
+ * The obligations endpoint returns raw on-chain state.
+ * marketValueSf is a scaled-factor (18 decimals) representing USD value.
+ * We also fetch /reserves/metrics for each market to map reserve addresses → token symbols + APYs.
  */
 
 import type { RawDefiPosition } from "../types";
 
 const KAMINO_API = "https://api.kamino.finance";
 
-interface KaminoObligation {
-  address: string;
-  lendingMarket: string;
-  deposits: Array<{
-    mintAddress: string;
-    symbol: string;
-    amount: number;
-    amountUSD: number;
-    apy: number;
-  }>;
-  borrows: Array<{
-    mintAddress: string;
-    symbol: string;
-    amount: number;
-    amountUSD: number;
-    apy: number;
-  }>;
+// Known Kamino lending markets to scan
+const KAMINO_MARKETS = [
+  "7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF", // Main market
+  "DxXdAyU3kCjnyggvHmY5nAwg5cRbbmdyX3npfDMjjMek", // JLP market
+  "ByYiZxp8QrdN9ocx5rvzDPGRDceL34WE4f2YsUjSpump", // Altcoin market
+];
+
+const SF_DECIMALS = 1e18; // marketValueSf scale factor
+
+interface ReserveMetrics {
+  reserve: string;
+  liquidityToken: string;
+  liquidityTokenMint: string;
+  supplyApy: string;
+  borrowApy: string;
+}
+
+interface RawDeposit {
+  depositReserve: string;
+  depositedAmount: string;
+  marketValueSf: string;
+}
+
+interface RawBorrow {
+  borrowReserve: string;
+  borrowedAmountSf: string;
+  marketValueSf: string;
+}
+
+interface RawObligation {
+  obligationAddress: string;
+  state: {
+    lendingMarket: string;
+    owner: string;
+    deposits: RawDeposit[];
+    borrows: RawBorrow[];
+  };
+}
+
+async function fetchReserveMetrics(
+  market: string
+): Promise<Map<string, ReserveMetrics>> {
+  const map = new Map<string, ReserveMetrics>();
+  try {
+    const res = await fetch(
+      `${KAMINO_API}/kamino-market/${market}/reserves/metrics`,
+      { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(10_000) }
+    );
+    if (!res.ok) return map;
+    const data: ReserveMetrics[] = await res.json();
+    for (const r of data) {
+      map.set(r.reserve, r);
+    }
+  } catch {
+    // reserve metadata is best-effort
+  }
+  return map;
 }
 
 export async function fetchKaminoPositions(
@@ -32,80 +76,106 @@ export async function fetchKaminoPositions(
   const positions: RawDefiPosition[] = [];
 
   try {
-    const url = `${KAMINO_API}/v2/users/${walletAddress}/obligations`;
-    const res = await fetch(url, {
-      headers: { Accept: "application/json" },
-    });
-    if (!res.ok) return [];
+    // Query all known markets in parallel: obligations + reserves metrics
+    const marketResults = await Promise.all(
+      KAMINO_MARKETS.map(async (market) => {
+        try {
+          const [oblRes, reserveMap] = await Promise.all([
+            fetch(
+              `${KAMINO_API}/kamino-market/${market}/users/${walletAddress}/obligations`,
+              { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(15_000) }
+            ),
+            fetchReserveMetrics(market),
+          ]);
+          if (!oblRes.ok) return { obligations: [] as RawObligation[], reserveMap };
+          const data = await oblRes.json();
+          const obligations: RawObligation[] = Array.isArray(data) ? data : [];
+          return { obligations, reserveMap };
+        } catch {
+          return { obligations: [] as RawObligation[], reserveMap: new Map<string, ReserveMetrics>() };
+        }
+      })
+    );
 
-    const obligations: KaminoObligation[] = await res.json();
-    if (!Array.isArray(obligations)) return [];
+    for (const { obligations, reserveMap } of marketResults) {
+      for (const obl of obligations) {
+        const state = obl.state;
+        if (!state) continue;
 
-    for (const obl of obligations) {
-      for (const dep of obl.deposits ?? []) {
-        if (!dep.amountUSD || dep.amountUSD <= 0.01) continue;
-        positions.push({
-          protocol: "kamino",
-          chain: "solana",
-          position_type: "lend",
-          asset_symbol: dep.symbol ?? "UNKNOWN",
-          asset_address: dep.mintAddress,
-          amount: dep.amount ?? 0,
-          price_usd: dep.amount > 0 ? dep.amountUSD / dep.amount : null,
-          value_usd: dep.amountUSD,
-          is_debt: false,
-          apy: dep.apy ?? null,
-          extra_data: { market: obl.lendingMarket },
-        });
-      }
+        // Process deposits
+        for (const dep of state.deposits ?? []) {
+          if (dep.depositReserve === "11111111111111111111111111111111111") continue;
+          const valueUsd = Number(BigInt(dep.marketValueSf)) / SF_DECIMALS;
+          if (valueUsd < 0.01) continue;
 
-      for (const bor of obl.borrows ?? []) {
-        if (!bor.amountUSD || bor.amountUSD <= 0.01) continue;
-        positions.push({
-          protocol: "kamino",
-          chain: "solana",
-          position_type: "borrow",
-          asset_symbol: bor.symbol ?? "UNKNOWN",
-          asset_address: bor.mintAddress,
-          amount: bor.amount ?? 0,
-          price_usd: bor.amount > 0 ? bor.amountUSD / bor.amount : null,
-          value_usd: bor.amountUSD,
-          is_debt: true,
-          apy: bor.apy ?? null,
-          extra_data: { market: obl.lendingMarket },
-        });
+          const meta = reserveMap.get(dep.depositReserve);
+          positions.push({
+            protocol: "kamino",
+            chain: "solana",
+            position_type: "lend",
+            asset_symbol: meta?.liquidityToken ?? "UNKNOWN",
+            asset_address: meta?.liquidityTokenMint ?? dep.depositReserve,
+            amount: valueUsd, // amount in USD (raw token amount not reliably available)
+            price_usd: 1.0,
+            value_usd: valueUsd,
+            is_debt: false,
+            apy: meta?.supplyApy ? parseFloat(meta.supplyApy) * 100 : null,
+            extra_data: { market: state.lendingMarket, reserve: dep.depositReserve },
+          });
+        }
+
+        // Process borrows
+        for (const bor of state.borrows ?? []) {
+          if (bor.borrowReserve === "11111111111111111111111111111111111") continue;
+          const valueUsd = Number(BigInt(bor.marketValueSf)) / SF_DECIMALS;
+          if (valueUsd < 0.01) continue;
+
+          const meta = reserveMap.get(bor.borrowReserve);
+          positions.push({
+            protocol: "kamino",
+            chain: "solana",
+            position_type: "borrow",
+            asset_symbol: meta?.liquidityToken ?? "UNKNOWN",
+            asset_address: meta?.liquidityTokenMint ?? bor.borrowReserve,
+            amount: valueUsd,
+            price_usd: 1.0,
+            value_usd: valueUsd,
+            is_debt: true,
+            apy: meta?.borrowApy ? -(parseFloat(meta.borrowApy) * 100) : null,
+            extra_data: { market: state.lendingMarket, reserve: bor.borrowReserve },
+          });
+        }
       }
     }
   } catch (err) {
     console.error("Kamino fetch error:", err);
   }
 
-  // Also fetch Kamino vaults (liquidity strategies)
+  // Also fetch Kamino kvaults positions
   try {
-    const vaultUrl = `${KAMINO_API}/v2/users/${walletAddress}/strategies`;
+    const vaultUrl = `${KAMINO_API}/kvaults/users/${walletAddress}/positions`;
     const vaultRes = await fetch(vaultUrl, {
       headers: { Accept: "application/json" },
+      signal: AbortSignal.timeout(15_000),
     });
     if (vaultRes.ok) {
       const vaults = await vaultRes.json();
       if (Array.isArray(vaults)) {
         for (const vault of vaults) {
-          const valueUsd = vault.balanceUSD ?? vault.sharesValueUSD ?? 0;
+          const valueUsd = vault.balanceUSD ?? vault.sharesValueUSD ?? vault.valueUsd ?? 0;
           if (valueUsd <= 0.01) continue;
           positions.push({
             protocol: "kamino",
             chain: "solana",
             position_type: "vault",
-            asset_symbol: vault.strategy?.tokenA?.symbol
-              ? `${vault.strategy.tokenA.symbol}/${vault.strategy.tokenB?.symbol ?? ""}`
-              : "VAULT",
-            asset_address: vault.strategy?.address ?? null,
-            amount: vault.sharesAmount ?? 0,
+            asset_symbol: vault.symbol ?? vault.name ?? "VAULT",
+            asset_address: vault.vaultPubkey ?? vault.address ?? null,
+            amount: vault.sharesAmount ?? valueUsd,
             price_usd: null,
             value_usd: valueUsd,
             is_debt: false,
-            apy: vault.apy ?? vault.strategy?.apy ?? null,
-            extra_data: { strategy: vault.strategy?.address },
+            apy: vault.apy ?? null,
+            extra_data: { vault: vault.vaultPubkey ?? vault.address },
           });
         }
       }

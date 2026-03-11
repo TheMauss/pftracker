@@ -1,6 +1,7 @@
 /**
- * Fetches Pendle Finance positions via Pendle REST API.
- * Supports HyperEVM (chainId 999), Ethereum (1), and Arbitrum (42161).
+ * Fetches Pendle Finance positions via the Pendle Dashboard API.
+ * GET /v1/dashboard/positions/database/{user}
+ * Returns all positions across all chains in one call.
  */
 
 import type { RawDefiPosition } from "../types";
@@ -8,116 +9,159 @@ import type { ChainId } from "../types";
 
 const PENDLE_API = "https://api-v2.pendle.finance/core";
 
-const CHAIN_MAP: Record<string, number> = {
+const CHAIN_ID_TO_NAME: Record<number, ChainId> = {
+  999: "hyperevm",
+  1: "ethereum",
+  42161: "arbitrum",
+};
+
+const CHAIN_NAME_TO_ID: Record<string, number> = {
   hyperevm: 999,
   ethereum: 1,
   arbitrum: 42161,
 };
 
-interface PendlePosition {
-  pt: {
-    address: string;
-    symbol: string;
-    expiry: string;
-    priceUsd: number;
-  };
-  yt: {
-    address: string;
-    symbol: string;
-    priceUsd: number;
-  };
-  lp: {
-    address: string;
-    symbol: string;
-    priceUsd: number;
-  };
-  ptBalance: string;
-  ytBalance: string;
-  lpBalance: string;
-  ptValueUsd: number;
-  ytValueUsd: number;
-  lpValueUsd: number;
-  impliedApy: number;
-  fixedApy: number;
+interface PendleDashboardPosition {
+  chainId: number;
+  totalOpen: number;
+  totalClosed: number;
+  openPositions: Array<{
+    marketId: string;
+    pt: { valuation: number; balance: string };
+    yt: { valuation: number; balance: string };
+    lp: { valuation: number; balance: string; activeBalance: string };
+  }>;
+  syPositions: Array<{
+    syAddress: string;
+    valuation: number;
+    balance: string;
+  }>;
+}
+
+interface PendleDashboardResponse {
+  positions: PendleDashboardPosition[];
+}
+
+// Cache for market metadata (symbol lookup)
+const marketSymbolCache = new Map<string, string>();
+
+async function getMarketSymbol(chainId: number, marketId: string): Promise<string> {
+  const key = `${chainId}-${marketId}`;
+  if (marketSymbolCache.has(key)) return marketSymbolCache.get(key)!;
+
+  try {
+    const res = await fetch(
+      `${PENDLE_API}/v1/${chainId}/markets/${marketId}`,
+      { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(5_000) }
+    );
+    if (res.ok) {
+      const data = await res.json();
+      const symbol = data?.pt?.name ?? data?.name ?? data?.symbol ?? marketId.slice(0, 10);
+      marketSymbolCache.set(key, symbol);
+      return symbol;
+    }
+  } catch {
+    // fallback
+  }
+  return marketId.split("-").pop()?.slice(0, 10) ?? "PENDLE";
 }
 
 export async function fetchPendlePositions(
   walletAddress: string,
   chain: ChainId
 ): Promise<RawDefiPosition[]> {
-  const pendleChainId = CHAIN_MAP[chain];
-  if (!pendleChainId) return [];
+  const targetChainId = CHAIN_NAME_TO_ID[chain];
+  if (!targetChainId) return [];
 
   const positions: RawDefiPosition[] = [];
 
   try {
-    const url = `${PENDLE_API}/v1/${pendleChainId}/positions?address=${walletAddress}`;
-    const res = await fetch(url, { headers: { Accept: "application/json" } });
+    const url = `${PENDLE_API}/v1/dashboard/positions/database/${walletAddress}`;
+    const res = await fetch(url, {
+      headers: { Accept: "application/json" },
+      signal: AbortSignal.timeout(15_000),
+    });
 
-    if (!res.ok) {
-      // Try alternate endpoint
-      return await fetchPendleV2(walletAddress, pendleChainId, chain);
-    }
+    if (!res.ok) return positions;
 
-    const data = await res.json();
-    const pendlePositions: PendlePosition[] = data?.positions ?? data ?? [];
+    const data: PendleDashboardResponse = await res.json();
 
-    for (const pos of pendlePositions) {
-      // PT position (fixed yield)
-      const ptAmount = parseFloat(pos.ptBalance ?? "0");
-      if (ptAmount > 0 && pos.ptValueUsd > 0.01) {
-        positions.push({
-          protocol: "pendle",
-          chain,
-          position_type: "pt",
-          asset_symbol: pos.pt?.symbol ?? "PT",
-          asset_address: pos.pt?.address ?? null,
-          amount: ptAmount,
-          price_usd: pos.pt?.priceUsd ?? null,
-          value_usd: pos.ptValueUsd,
-          is_debt: false,
-          apy: pos.fixedApy ?? null,
-          extra_data: {
-            expiry: pos.pt?.expiry,
-            type: "principal_token",
-            impliedApy: pos.impliedApy,
-          },
-        });
+    for (const chainPositions of data.positions ?? []) {
+      // Only process the requested chain
+      if (chainPositions.chainId !== targetChainId) continue;
+      const chainName = CHAIN_ID_TO_NAME[chainPositions.chainId] ?? chain;
+
+      for (const pos of chainPositions.openPositions ?? []) {
+        const marketSymbol = await getMarketSymbol(chainPositions.chainId, pos.marketId);
+
+        // PT position
+        if (pos.pt?.valuation > 0.01) {
+          positions.push({
+            protocol: "pendle",
+            chain: chainName,
+            position_type: "pt",
+            asset_symbol: `PT-${marketSymbol}`,
+            asset_address: pos.marketId,
+            amount: parseFloat(pos.pt.balance || "0"),
+            price_usd: null,
+            value_usd: pos.pt.valuation,
+            is_debt: false,
+            apy: null,
+            extra_data: { type: "principal_token", marketId: pos.marketId },
+          });
+        }
+
+        // YT position
+        if (pos.yt?.valuation > 0.01) {
+          positions.push({
+            protocol: "pendle",
+            chain: chainName,
+            position_type: "yt",
+            asset_symbol: `YT-${marketSymbol}`,
+            asset_address: pos.marketId,
+            amount: parseFloat(pos.yt.balance || "0"),
+            price_usd: null,
+            value_usd: pos.yt.valuation,
+            is_debt: false,
+            apy: null,
+            extra_data: { type: "yield_token", marketId: pos.marketId },
+          });
+        }
+
+        // LP position
+        const lpVal = pos.lp?.valuation ?? 0;
+        if (lpVal > 0.01) {
+          positions.push({
+            protocol: "pendle",
+            chain: chainName,
+            position_type: "lp",
+            asset_symbol: `LP-${marketSymbol}`,
+            asset_address: pos.marketId,
+            amount: parseFloat(pos.lp.balance || "0"),
+            price_usd: null,
+            value_usd: lpVal,
+            is_debt: false,
+            apy: null,
+            extra_data: { type: "lp_token", marketId: pos.marketId },
+          });
+        }
       }
 
-      // YT position (yield token — leveraged yield)
-      const ytAmount = parseFloat(pos.ytBalance ?? "0");
-      if (ytAmount > 0 && pos.ytValueUsd > 0.01) {
+      // SY positions (standardized yield tokens)
+      for (const sy of chainPositions.syPositions ?? []) {
+        if (sy.valuation <= 0.01) continue;
         positions.push({
           protocol: "pendle",
-          chain,
-          position_type: "yt",
-          asset_symbol: pos.yt?.symbol ?? "YT",
-          asset_address: pos.yt?.address ?? null,
-          amount: ytAmount,
-          price_usd: pos.yt?.priceUsd ?? null,
-          value_usd: pos.ytValueUsd,
+          chain: chainName,
+          position_type: "vault",
+          asset_symbol: `SY-${sy.syAddress.slice(0, 8)}`,
+          asset_address: sy.syAddress,
+          amount: parseFloat(sy.balance || "0"),
+          price_usd: null,
+          value_usd: sy.valuation,
           is_debt: false,
-          apy: pos.impliedApy ?? null,
-          extra_data: { type: "yield_token" },
-        });
-      }
-
-      // LP position
-      const lpAmount = parseFloat(pos.lpBalance ?? "0");
-      if (lpAmount > 0 && pos.lpValueUsd > 0.01) {
-        positions.push({
-          protocol: "pendle",
-          chain,
-          position_type: "lp",
-          asset_symbol: pos.lp?.symbol ?? "LP",
-          asset_address: pos.lp?.address ?? null,
-          amount: lpAmount,
-          price_usd: pos.lp?.priceUsd ?? null,
-          value_usd: pos.lpValueUsd,
-          is_debt: false,
-          apy: pos.impliedApy ?? null,
-          extra_data: { type: "lp_token" },
+          apy: null,
+          extra_data: { type: "sy_token" },
         });
       }
     }
@@ -125,31 +169,5 @@ export async function fetchPendlePositions(
     console.error(`Pendle fetch error (chain ${chain}):`, err);
   }
 
-  return positions;
-}
-
-async function fetchPendleV2(
-  walletAddress: string,
-  chainId: number,
-  chain: ChainId
-): Promise<RawDefiPosition[]> {
-  const positions: RawDefiPosition[] = [];
-  try {
-    // Get all markets for this chain, then check balances
-    const marketsUrl = `${PENDLE_API}/v2/${chainId}/markets?limit=100`;
-    const res = await fetch(marketsUrl, { headers: { Accept: "application/json" } });
-    if (!res.ok) return [];
-
-    const data = await res.json();
-    const markets = data?.results ?? data?.markets ?? [];
-
-    // For each market, check if user has PT/YT/LP via ERC20 balance
-    // This is a fallback — just return empty for now and rely on main endpoint
-    void markets;
-    void walletAddress;
-    void chain;
-  } catch {
-    // ignore
-  }
   return positions;
 }

@@ -17,15 +17,17 @@ import { fetchHyperliquidBalances } from "./chains/hyperliquid";
 import { fetchKaminoPositions } from "./defi/solana-kamino";
 import { fetchJlpPosition, JLP_MINT } from "./defi/solana-jlp";
 import { fetchDriftPositions } from "./defi/solana-drift";
-import { fetchMarginFiPositions } from "./defi/solana-marginfi";
-import { fetchOrcaPositions } from "./defi/solana-orca";
-import { fetchRaydiumPositions } from "./defi/solana-raydium";
-import { fetchMeteoraPositions } from "./defi/solana-meteora";
+// MarginFi, Orca, Raydium, Meteora APIs are currently broken/changed (404s)
+// import { fetchMarginFiPositions } from "./defi/solana-marginfi";
+// import { fetchOrcaPositions } from "./defi/solana-orca";
+// import { fetchRaydiumPositions } from "./defi/solana-raydium";
+// import { fetchMeteoraPositions } from "./defi/solana-meteora";
 import { fetchFelixPositions } from "./defi/hyper-felix";
 import { fetchHyperlendPositions } from "./defi/hyper-hyperlend";
 import { fetchPendlePositions } from "./defi/hyper-pendle";
 import { fetchAavePositions } from "./defi/evm-aave";
-import { fetchUniswapPositions } from "./defi/evm-uniswap";
+// Uniswap subgraph is dead (hosted service shut down), always returns $0
+// import { fetchUniswapPositions } from "./defi/evm-uniswap";
 import { fetchGmxPositions } from "./defi/evm-gmx";
 import type { Wallet, RawTokenBalance, RawDefiPosition } from "./types";
 
@@ -182,7 +184,7 @@ async function fetchAllDefiPositions(
   const positions: RawDefiPosition[] = [];
   const errors: string[] = [];
 
-  const DEFI_TIMEOUT_MS = 20_000;
+  const DEFI_TIMEOUT_MS = 45_000;
 
   const fetchWithCatch = async (
     name: string,
@@ -206,10 +208,11 @@ async function fetchAllDefiPositions(
     await Promise.all([
       fetchWithCatch("kamino", () => fetchKaminoPositions(wallet.address)),
       fetchWithCatch("drift", () => fetchDriftPositions(wallet.address)),
-      fetchWithCatch("marginfi", () => fetchMarginFiPositions(wallet.address)),
-      fetchWithCatch("orca", () => fetchOrcaPositions(wallet.address)),
-      fetchWithCatch("raydium", () => fetchRaydiumPositions(wallet.address)),
-      fetchWithCatch("meteora", () => fetchMeteoraPositions(wallet.address)),
+      // MarginFi, Orca, Raydium, Meteora APIs are currently broken/changed (404s)
+      // fetchWithCatch("marginfi", () => fetchMarginFiPositions(wallet.address)),
+      // fetchWithCatch("orca", () => fetchOrcaPositions(wallet.address)),
+      // fetchWithCatch("raydium", () => fetchRaydiumPositions(wallet.address)),
+      // fetchWithCatch("meteora", () => fetchMeteoraPositions(wallet.address)),
       ...(jlpToken && jlpToken.amount > 0
         ? [fetchWithCatch("jlp", async () => {
             const pos = await fetchJlpPosition(wallet.address, jlpToken.amount);
@@ -227,16 +230,17 @@ async function fetchAllDefiPositions(
       fetchWithCatch("pendle-hyperevm", () => fetchPendlePositions(wallet.address, "hyperevm")),
       // Ethereum DeFi
       fetchWithCatch("aave-eth", () => fetchAavePositions(wallet.address, "ethereum")),
-      fetchWithCatch("uniswap-eth", () => fetchUniswapPositions(wallet.address, "ethereum")),
+      // Uniswap subgraph is dead (hosted service shut down), always returns $0
+      // fetchWithCatch("uniswap-eth", () => fetchUniswapPositions(wallet.address, "ethereum")),
       fetchWithCatch("pendle-eth", () => fetchPendlePositions(wallet.address, "ethereum")),
       // Arbitrum DeFi
       fetchWithCatch("aave-arb", () => fetchAavePositions(wallet.address, "arbitrum")),
-      fetchWithCatch("uniswap-arb", () => fetchUniswapPositions(wallet.address, "arbitrum")),
+      // fetchWithCatch("uniswap-arb", () => fetchUniswapPositions(wallet.address, "arbitrum")),
       fetchWithCatch("pendle-arb", () => fetchPendlePositions(wallet.address, "arbitrum")),
       fetchWithCatch("gmx", () => fetchGmxPositions(wallet.address)),
       // Base DeFi
       fetchWithCatch("aave-base", () => fetchAavePositions(wallet.address, "base")),
-      fetchWithCatch("uniswap-base", () => fetchUniswapPositions(wallet.address, "base")),
+      // fetchWithCatch("uniswap-base", () => fetchUniswapPositions(wallet.address, "base")),
     ]);
   }
 
