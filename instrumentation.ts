@@ -33,4 +33,16 @@ export async function register() {
   );
 
   console.log("[cron] Daily snapshot scheduled at midnight Europe/Prague");
+
+  // Every 15 minutes — save arbitrage funding + price spread history
+  cron.default.schedule("*/15 * * * *", async () => {
+    try {
+      const { fetchDeltaNeutralData, fetchPriceArbitrage } = await import("./lib/yields");
+      await Promise.allSettled([fetchDeltaNeutralData(), fetchPriceArbitrage()]);
+    } catch (err) {
+      console.error("[cron] Arbitrage history save failed:", err);
+    }
+  });
+
+  console.log("[cron] Arbitrage history scheduled every 15 minutes");
 }

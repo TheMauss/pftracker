@@ -13,6 +13,13 @@ const AAVE_DATA_PROVIDERS: Record<string, `0x${string}`> = {
   arbitrum: "0x6b4E260b765B3cA1514e618C0215A6B7839fF93e",
 };
 
+// Aave V3 Pool addresses (for getUserAccountData → health factor)
+const AAVE_POOLS: Record<string, `0x${string}`> = {
+  ethereum: "0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2",
+  base:     "0xA238Dd80C259a72e81d7e4664a9801593F98d1c5",
+  arbitrum: "0x794a61358D6845594F94dc1DB02A252b5b4814aD",
+};
+
 const AAVE_ORACLES: Record<string, `0x${string}`> = {
   ethereum: "0x54586bE62E3c3580375aE3723C145253060Ca0C2",
   base: "0x2Cc0Fc26eD4563A5ce5e8bdcfe1A2878676Ae156",
@@ -49,6 +56,10 @@ const ORACLE_ABI = parseAbi([
 
 const ERC20_ABI = parseAbi([
   "function decimals() external view returns (uint8)",
+]);
+
+const POOL_ABI = parseAbi([
+  "function getUserAccountData(address user) external view returns (uint256 totalCollateralBase, uint256 totalDebtBase, uint256 availableBorrowsBase, uint256 currentLiquidationThreshold, uint256 ltv, uint256 healthFactor)",
 ]);
 
 const RAY = 10n ** 27n;
@@ -99,6 +110,8 @@ export async function fetchAavePositions(
         ...reserves.map((r) => ({ address: dataProvider, abi: DATA_PROVIDER_ABI, functionName: "getReserveData",     args: [r.tokenAddress as `0x${string}`] })),
         ...reserves.map((r) => ({ address: r.tokenAddress as `0x${string}`, abi: ERC20_ABI, functionName: "decimals" })),
         ...(oracleAddr ? reserves.map((r) => ({ address: oracleAddr, abi: ORACLE_ABI, functionName: "getAssetPrice", args: [r.tokenAddress as `0x${string}`] })) : []),
+        // getUserAccountData for health factor (one call per wallet)
+        ...(AAVE_POOLS[chain] ? [{ address: AAVE_POOLS[chain] as `0x${string}`, abi: POOL_ABI, functionName: "getUserAccountData" as const, args: [walletAddress as `0x${string}`] }] : []),
       ],
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } as any)) as MC[];
@@ -108,6 +121,17 @@ export async function fetchAavePositions(
     const reserveDataResults = batch.slice(n, 2 * n);
     const decimalsResults   = batch.slice(2 * n, 3 * n);
     const priceResults      = oracleAddr ? batch.slice(3 * n, 4 * n) : [];
+
+    // Parse health factor from getUserAccountData
+    const accountDataEntry = AAVE_POOLS[chain] ? batch[oracleAddr ? 4 * n : 3 * n] : null;
+    let healthFactor: number | null = null;
+    let liquidationThresholdPct: number | null = null;
+    if (accountDataEntry?.status === "success" && accountDataEntry.result) {
+      const [, , , liqThreshRaw, , hfRaw] = accountDataEntry.result as bigint[];
+      const hfNum = Number(hfRaw) / 1e18;
+      healthFactor = hfNum > 1_000_000 ? null : +hfNum.toFixed(4); // ∞ means no borrows
+      liquidationThresholdPct = Number(liqThreshRaw) / 100; // basis points → %
+    }
 
     for (let i = 0; i < reserves.length; i++) {
       const userEntry = userDataResults[i];
@@ -143,6 +167,7 @@ export async function fetchAavePositions(
             value_usd: valueUsd,
             is_debt: false,
             apy: depositApy,
+            extra_data: healthFactor !== null ? { health_factor: healthFactor, liquidation_threshold_pct: liquidationThresholdPct } : undefined,
           });
         }
       }
@@ -162,6 +187,7 @@ export async function fetchAavePositions(
             value_usd: valueUsd,
             is_debt: true,
             apy: -borrowApy,
+            extra_data: healthFactor !== null ? { health_factor: healthFactor, liquidation_threshold_pct: liquidationThresholdPct } : undefined,
           });
         }
       }

@@ -8,6 +8,14 @@ import type { RawTokenBalance, ChainId } from "../types";
 import { createPublicClient, http, formatEther } from "viem";
 import { getCoinGeckoPrices } from "../prices";
 
+// Tokens that are DeFi positions (tracked via protocol fetchers).
+// Mark as is_derivative=true to avoid double-counting in portfolio totals.
+const DEFI_DERIVATIVE_ADDRESSES = new Set([
+  "0xae7ab96520de3a18e5e111b5eaab095312d7fe84", // stETH (Lido)
+  "0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0", // wstETH (Lido)
+  "0x9d39a5de30e57443bff2a8307a4256c8797a3497", // sUSDe (Ethena)
+]);
+
 // BSC not supported by Alchemy - excluded
 const ALCHEMY_CHAIN: Record<string, string> = {
   ethereum: "eth-mainnet",
@@ -175,6 +183,7 @@ export async function fetchEvmBalances(
 
       if (valueUsd < 0.01 && priceUsd !== null) continue;
 
+      const isDerivative = DEFI_DERIVATIVE_ADDRESSES.has(raw.contractAddress.toLowerCase());
       tokens.push({
         token_symbol: meta.symbol ?? "UNKNOWN",
         token_name: meta.name ?? null,
@@ -183,6 +192,7 @@ export async function fetchEvmBalances(
         amount,
         price_usd: priceUsd,
         value_usd: valueUsd,
+        is_derivative: isDerivative,
       });
     }
 

@@ -4,18 +4,30 @@ import { useState } from "react";
 import type { Wallet } from "@/lib/types";
 
 const CHAINS = [
-  { value: "solana", label: "Solana" },
-  { value: "evm", label: "EVM (Ethereum / Base / Arbitrum / BSC / Hyperliquid)" },
+  { value: "solana",  label: "Solana" },
+  { value: "evm",     label: "EVM (Ethereum / Base / Arbitrum / BSC / Hyperliquid)" },
+  { value: "sui",     label: "Sui" },
+  { value: "bitcoin", label: "Bitcoin" },
 ] as const;
 
-interface Props {
-  wallets: Wallet[];
-  onRefresh: () => void;
-}
+const CHAIN_COLOR: Record<string, string> = {
+  solana:      "#9945ff",
+  evm:         "#627eea",
+  ethereum:    "#627eea",
+  base:        "#0052ff",
+  arbitrum:    "#12aaff",
+  bsc:         "#f3ba2f",
+  hyperliquid: "#3cffa0",
+  hyperevm:    "#3cffa0",
+  sui:         "#4da2ff",
+  bitcoin:     "#f7931a",
+};
+
+interface Props { wallets: Wallet[]; onRefresh: () => void; }
 
 export default function WalletManager({ wallets, onRefresh }: Props) {
   const [address, setAddress] = useState("");
-  const [chain, setChain] = useState<"solana" | "evm">("solana");
+  const [chain, setChain] = useState<"solana" | "evm" | "sui" | "bitcoin">("solana");
   const [label, setLabel] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -28,16 +40,11 @@ export default function WalletManager({ wallets, onRefresh }: Props) {
       const res = await fetch("/api/wallets", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ address: address.trim(), chain, label: label.trim() || undefined, }),
+        body: JSON.stringify({ address: address.trim(), chain, label: label.trim() || undefined }),
       });
       const data = await res.json();
-      if (!res.ok) {
-        setError(data.error ?? "Chyba");
-        return;
-      }
-      setAddress("");
-      setLabel("");
-      onRefresh();
+      if (!res.ok) { setError(data.error ?? "Chyba"); return; }
+      setAddress(""); setLabel(""); onRefresh();
     } catch (err) {
       setError(String(err));
     } finally {
@@ -53,17 +60,18 @@ export default function WalletManager({ wallets, onRefresh }: Props) {
 
   return (
     <div className="space-y-4">
-      {/* Add wallet form */}
-      <div className="bg-gray-900 rounded-xl border border-gray-800 p-5">
-        <h2 className="font-semibold text-white mb-4">Přidat peněženku</h2>
+      {/* Add wallet */}
+      <div className="card rounded-2xl p-5">
+        <h2 className="text-sm font-semibold mb-4" style={{ color: "#f0f0f0" }}>Přidat peněženku</h2>
         <div className="flex flex-wrap gap-2">
           <select
             value={chain}
-            onChange={(e) => setChain(e.target.value as "solana" | "evm")}
-            className="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-gray-300 focus:outline-none focus:border-indigo-500"
+            onChange={(e) => setChain(e.target.value as "solana" | "evm" | "sui" | "bitcoin")}
+            className="input-field rounded-xl px-3 py-2.5 text-sm"
+            style={{ background: "#080808" }}
           >
             {CHAINS.map((c) => (
-              <option key={c.value} value={c.value}>
+              <option key={c.value} value={c.value} style={{ background: "#101013" }}>
                 {c.label}
               </option>
             ))}
@@ -74,7 +82,7 @@ export default function WalletManager({ wallets, onRefresh }: Props) {
             value={address}
             onChange={(e) => setAddress(e.target.value)}
             placeholder="Adresa peněženky"
-            className="flex-1 min-w-0 bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-gray-300 placeholder-gray-600 focus:outline-none focus:border-indigo-500 font-mono"
+            className="input-field flex-1 min-w-0 rounded-xl px-3 py-2.5 text-sm font-mono"
           />
 
           <input
@@ -82,61 +90,89 @@ export default function WalletManager({ wallets, onRefresh }: Props) {
             value={label}
             onChange={(e) => setLabel(e.target.value)}
             placeholder="Název (volitelné)"
-            className="w-36 bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-gray-300 placeholder-gray-600 focus:outline-none focus:border-indigo-500"
+            className="input-field w-36 rounded-xl px-3 py-2.5 text-sm"
           />
 
           <button
             onClick={addWallet}
             disabled={loading || !address.trim()}
-            className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white text-sm rounded font-medium transition-colors"
+            className="btn-primary px-5 py-2.5 text-sm rounded-xl"
           >
-            {loading ? "Přidávám..." : "Přidat"}
+            {loading ? "Přidávám…" : "Přidat"}
           </button>
         </div>
 
         {error && (
-          <div className="mt-2 text-red-400 text-sm">{error}</div>
+          <div
+            className="mt-3 text-sm rounded-xl px-3.5 py-2.5"
+            style={{ color: "#ff3d5a", background: "rgba(255,61,90,0.08)", border: "1px solid rgba(255,61,90,0.2)" }}
+          >
+            {error}
+          </div>
         )}
       </div>
 
       {/* Wallet list */}
-      <div className="bg-gray-900 rounded-xl border border-gray-800">
-        <div className="p-4 border-b border-gray-800">
-          <h2 className="font-semibold text-white">
-            Peněženky ({wallets.length})
+      <div className="card rounded-2xl overflow-hidden">
+        <div
+          className="px-5 py-3.5 flex items-center justify-between"
+          style={{ borderBottom: "1px solid rgba(255,255,255,0.05)" }}
+        >
+          <h2 className="text-sm font-semibold" style={{ color: "#f0f0f0" }}>
+            Peněženky <span className="font-normal" style={{ color: "#404040" }}>({wallets.length})</span>
           </h2>
         </div>
         {wallets.length === 0 ? (
-          <div className="p-8 text-center text-gray-500 text-sm">
+          <div className="p-12 text-center text-xs" style={{ color: "#303030" }}>
             Žádné peněženky. Přidej svou první výše.
           </div>
         ) : (
-          <table className="w-full text-sm">
+          <table className="w-full text-xs">
             <thead>
-              <tr className="text-gray-500 text-xs border-b border-gray-800">
-                <th className="text-left px-4 py-2">Název</th>
-                <th className="text-left px-4 py-2">Chain</th>
-                <th className="text-left px-4 py-2">Adresa</th>
-                <th className="px-4 py-2" />
+              <tr style={{ borderBottom: "1px solid rgba(255,255,255,0.04)" }}>
+                {["Název", "Chain", "Adresa", ""].map((h, i) => (
+                  <th key={i} className="px-5 py-2.5 stat-label text-left">{h}</th>
+                ))}
               </tr>
             </thead>
             <tbody>
               {wallets.map((w) => (
                 <tr
                   key={w.id}
-                  className="border-b border-gray-800/50 hover:bg-gray-800/30 transition-colors"
+                  style={{ borderBottom: "1px solid rgba(255,255,255,0.03)" }}
+                  onMouseEnter={(e) => (e.currentTarget.style.background = "rgba(255,255,255,0.02)")}
+                  onMouseLeave={(e) => (e.currentTarget.style.background = "")}
                 >
-                  <td className="px-4 py-2.5 text-white">
+                  <td className="px-5 py-3.5 font-medium" style={{ color: "#f0f0f0" }}>
                     {w.label ?? `Peněženka ${w.id}`}
                   </td>
-                  <td className="px-4 py-2.5 text-gray-400 text-xs">{w.chain}</td>
-                  <td className="px-4 py-2.5 font-mono text-gray-400 text-xs">
-                    {w.address.slice(0, 12)}...{w.address.slice(-6)}
+                  <td className="px-5 py-3.5">
+                    <span
+                      className="text-xs font-bold uppercase tracking-wide px-2 py-0.5 rounded-md"
+                      style={{
+                        color: CHAIN_COLOR[w.chain] ?? "#606060",
+                        background: `${CHAIN_COLOR[w.chain] ?? "#606060"}15`,
+                      }}
+                    >
+                      {w.chain}
+                    </span>
                   </td>
-                  <td className="px-4 py-2.5 text-right">
+                  <td className="px-5 py-3.5 font-mono" style={{ color: "#404040" }}>
+                    {w.address.slice(0, 12)}…{w.address.slice(-6)}
+                  </td>
+                  <td className="px-5 py-3.5 text-right">
                     <button
                       onClick={() => deleteWallet(w.id)}
-                      className="text-gray-600 hover:text-red-400 transition-colors text-xs"
+                      className="text-xs px-2.5 py-1 rounded-lg transition-colors"
+                      style={{ color: "#404040" }}
+                      onMouseEnter={(e) => {
+                        (e.currentTarget as HTMLButtonElement).style.color = "#ff3d5a";
+                        (e.currentTarget as HTMLButtonElement).style.background = "rgba(255,61,90,0.08)";
+                      }}
+                      onMouseLeave={(e) => {
+                        (e.currentTarget as HTMLButtonElement).style.color = "#404040";
+                        (e.currentTarget as HTMLButtonElement).style.background = "";
+                      }}
                     >
                       Smazat
                     </button>

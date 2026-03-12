@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { takeSnapshot } from "@/lib/snapshot";
+import { invalidatePortfolioCache } from "@/lib/portfolio-cache";
 
 export async function POST(req: NextRequest) {
   // Protect with secret header
@@ -13,6 +14,7 @@ export async function POST(req: NextRequest) {
     const overwrite = body?.overwrite === true;
 
     const result = await takeSnapshot(overwrite);
+    invalidatePortfolioCache(); // next /api/portfolio call will re-fetch fresh data
     return NextResponse.json(result);
   } catch (err) {
     console.error("/api/snapshot error:", err);

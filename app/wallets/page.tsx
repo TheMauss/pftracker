@@ -15,8 +15,11 @@ export default function WalletsPage() {
   useEffect(() => { fetchWallets(); }, [fetchWallets]);
 
   return (
-    <div className="space-y-5">
-      <h1 className="text-xl font-bold text-white">Peněženky</h1>
+    <div className="space-y-6">
+      <div>
+        <h1 className="text-xl font-bold tracking-tight" style={{ color: "#f0f0f0" }}>Peněženky</h1>
+        <p className="text-xs mt-0.5" style={{ color: "#404040" }}>{wallets.length} peněženek sledováno</p>
+      </div>
       <WalletManager wallets={wallets} onRefresh={fetchWallets} />
     </div>
   );

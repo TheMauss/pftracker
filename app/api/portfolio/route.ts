@@ -1,13 +1,10 @@
 import { NextResponse } from "next/server";
-import { getLivePortfolio } from "@/lib/snapshot";
+import { getCachedPortfolio } from "@/lib/portfolio-cache";
 import type { PortfolioResponse, ChainAllocation, ProtocolAllocation } from "@/lib/types";
-
-// Cache live portfolio for 60 seconds
-export const revalidate = 60;
 
 export async function GET() {
   try {
-    const { totalUsd, wallets } = await getLivePortfolio();
+    const { totalUsd, wallets } = await getCachedPortfolio();
 
     // Aggregate by chain
     const chainMap = new Map<string, number>();

@@ -94,7 +94,64 @@ function runMigrations(db: Database.Database) {
     CREATE INDEX IF NOT EXISTS idx_wallet_snap_wallet_id ON wallet_snapshots(wallet_id);
     CREATE INDEX IF NOT EXISTS idx_token_bal_snap_id     ON token_balances(snapshot_id);
     CREATE INDEX IF NOT EXISTS idx_defi_pos_snap_id      ON defi_positions(snapshot_id);
+
+    CREATE TABLE IF NOT EXISTS stock_positions (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      source      TEXT NOT NULL,
+      ticker      TEXT NOT NULL,
+      name        TEXT,
+      quantity    REAL NOT NULL,
+      avg_price   REAL,
+      imported_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
   `);
+  // Price arbitrage history (spread tracking)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS price_arb_history (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      asset      TEXT NOT NULL,
+      hl_price   REAL NOT NULL,
+      lt_price   REAL NOT NULL,
+      spread_pct REAL NOT NULL,
+      net_pct    REAL NOT NULL,
+      fetched_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_price_arb_history_lookup
+      ON price_arb_history(asset, fetched_at);
+  `);
+
+  // Funding rate history (for arbitrage trend tracking)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS funding_history (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      asset      TEXT NOT NULL,
+      venue      TEXT NOT NULL,
+      rate_8h    REAL NOT NULL,
+      fetched_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_funding_history_lookup
+      ON funding_history(asset, venue, fetched_at);
+  `);
+
+  // Incremental migrations
+  try { db.exec(`ALTER TABLE stock_positions ADD COLUMN price_usd REAL`); } catch {}
+  try { db.exec(`ALTER TABLE stock_positions ADD COLUMN category TEXT NOT NULL DEFAULT 'Akcie'`); } catch {}
+
+  // Migration version tracking
+  db.exec(`CREATE TABLE IF NOT EXISTS schema_migrations (version TEXT PRIMARY KEY)`);
+
+  // v2: clear old snapshots that didn't include stock values
+  const hasV2 = db.prepare("SELECT 1 FROM schema_migrations WHERE version = 'v2_include_stocks'").get();
+  if (!hasV2) {
+    db.exec(`
+      DELETE FROM defi_positions;
+      DELETE FROM token_balances;
+      DELETE FROM wallet_snapshots;
+      DELETE FROM snapshots;
+    `);
+    db.prepare("INSERT INTO schema_migrations (version) VALUES ('v2_include_stocks')").run();
+    console.log("[db] Migration v2: cleared old snapshots (stocks not included in totals)");
+  }
 }
 
 // ─── Wallet queries ───────────────────────────────────────────────────────────
@@ -365,4 +422,200 @@ export function getLatestTokenBalances(walletId: number): TokenBalance[] {
       "SELECT * FROM token_balances WHERE snapshot_id = ? AND wallet_id = ?"
     )
     .all(latest.snapshot_id, walletId) as TokenBalance[];
+}
+
+// ─── Stock positions ──────────────────────────────────────────────────────────
+
+export interface StockPosition {
+  id: number;
+  source: string;
+  ticker: string;
+  name: string | null;
+  quantity: number;
+  avg_price: number | null;
+  price_usd: number | null;
+  category: string;
+  imported_at: string;
+}
+
+export function getStockPositions(): StockPosition[] {
+  return getDb().prepare("SELECT * FROM stock_positions ORDER BY ticker ASC").all() as StockPosition[];
+}
+
+export function upsertStockPositions(positions: Omit<StockPosition, "id" | "imported_at">[]): void {
+  const db = getDb();
+  const del = db.prepare("DELETE FROM stock_positions WHERE source = ?");
+  const ins = db.prepare("INSERT INTO stock_positions (source, ticker, name, quantity, avg_price) VALUES (?, ?, ?, ?, ?)");
+  const sources = [...new Set(positions.map((p) => p.source))];
+  const run = db.transaction(() => {
+    for (const src of sources) del.run(src);
+    for (const p of positions) ins.run(p.source, p.ticker, p.name ?? null, p.quantity, p.avg_price ?? null);
+  });
+  run();
+}
+
+export function deleteStockSource(source: string): void {
+  getDb().prepare("DELETE FROM stock_positions WHERE source = ?").run(source);
+}
+
+export function insertManualPosition(ticker: string, quantity: number, avg_price: number | null, name: string | null, price_usd: number | null = null, category = "Akcie"): number {
+  const result = getDb()
+    .prepare("INSERT INTO stock_positions (source, ticker, name, quantity, avg_price, price_usd, category) VALUES ('manual', ?, ?, ?, ?, ?, ?)")
+    .run(ticker.toUpperCase().trim(), name ?? null, quantity, avg_price ?? null, price_usd ?? null, category);
+  return result.lastInsertRowid as number;
+}
+
+export function updateStockPosition(id: number, fields: Partial<Pick<StockPosition, "ticker" | "name" | "quantity" | "avg_price" | "price_usd" | "category">>): void {
+  const db = getDb();
+  const sets: string[] = [];
+  const vals: unknown[] = [];
+  if (fields.ticker    !== undefined) { sets.push("ticker = ?");    vals.push(fields.ticker.toUpperCase().trim()); }
+  if (fields.name      !== undefined) { sets.push("name = ?");      vals.push(fields.name); }
+  if (fields.quantity  !== undefined) { sets.push("quantity = ?");  vals.push(fields.quantity); }
+  if (fields.avg_price !== undefined) { sets.push("avg_price = ?"); vals.push(fields.avg_price); }
+  if (fields.price_usd !== undefined) { sets.push("price_usd = ?"); vals.push(fields.price_usd); }
+  if (fields.category  !== undefined) { sets.push("category = ?");  vals.push(fields.category); }
+  if (!sets.length) return;
+  vals.push(id);
+  db.prepare(`UPDATE stock_positions SET ${sets.join(", ")} WHERE id = ?`).run(...(vals as any[]));
+}
+
+export function deleteStockPosition(id: number): void {
+  getDb().prepare("DELETE FROM stock_positions WHERE id = ?").run(id);
+}
+
+// ─── Funding rate history (arbitrage) ────────────────────────────────────────
+
+export interface FundingRecord {
+  asset: string;
+  venue: string;  // "hyperliquid" | "lighter"
+  rate_8h: number;
+  fetched_at: string;
+}
+
+/** Save a batch of funding records. Call at most once per ~15 min via shouldSaveFunding(). */
+export function saveFundingHistory(records: FundingRecord[]): void {
+  if (!records.length) return;
+  const db = getDb();
+  const ins = db.prepare(
+    "INSERT INTO funding_history (asset, venue, rate_8h, fetched_at) VALUES (?, ?, ?, ?)"
+  );
+  db.transaction(() => {
+    for (const r of records) ins.run(r.asset, r.venue, r.rate_8h, r.fetched_at);
+  })();
+}
+
+/** Returns true if no record exists within the last `minIntervalMs` ms. */
+export function shouldSaveFunding(minIntervalMs = 15 * 60_000): boolean {
+  const row = getDb()
+    .prepare("SELECT MAX(fetched_at) as latest FROM funding_history")
+    .get() as { latest: string | null };
+  if (!row.latest) return true;
+  return Date.now() - new Date(row.latest).getTime() > minIntervalMs;
+}
+
+/** Get rate closest to `targetIso` (within ±2 hours) for a given asset + venue. */
+export function getFundingNear(
+  asset: string,
+  venue: string,
+  targetIso: string
+): number | null {
+  const row = getDb()
+    .prepare(
+      `SELECT rate_8h FROM funding_history
+       WHERE asset = ? AND venue = ?
+         AND fetched_at >= datetime(?, '-2 hours')
+         AND fetched_at <= datetime(?, '+2 hours')
+       ORDER BY ABS(strftime('%s', fetched_at) - strftime('%s', ?))
+       LIMIT 1`
+    )
+    .get(asset, venue, targetIso, targetIso, targetIso) as
+    | { rate_8h: number }
+    | undefined;
+  return row?.rate_8h ?? null;
+}
+
+export interface FundingHistoryPoint {
+  fetched_at: string;
+  hl_rate: number | null;
+  lighter_rate: number | null;
+}
+
+/** Return all (asset, hl, lighter) pairs for the last `hoursBack` hours, one row per timestamp. */
+export function getFundingHistory(
+  asset: string,
+  hoursBack: number
+): FundingHistoryPoint[] {
+  const cutoff = new Date(Date.now() - hoursBack * 3_600_000).toISOString();
+  const rows = getDb()
+    .prepare(
+      `SELECT fetched_at, venue, rate_8h FROM funding_history
+       WHERE asset = ? AND fetched_at >= ?
+       ORDER BY fetched_at ASC`
+    )
+    .all(asset, cutoff) as { fetched_at: string; venue: string; rate_8h: number }[];
+
+  // Merge HL + Lighter rows that share the same fetched_at timestamp
+  const map = new Map<string, { hl: number | null; lighter: number | null }>();
+  for (const row of rows) {
+    if (!map.has(row.fetched_at)) map.set(row.fetched_at, { hl: null, lighter: null });
+    const entry = map.get(row.fetched_at)!;
+    if (row.venue === "hyperliquid") entry.hl = row.rate_8h;
+    else if (row.venue === "lighter") entry.lighter = row.rate_8h;
+  }
+  return Array.from(map.entries()).map(([fetched_at, r]) => ({
+    fetched_at,
+    hl_rate: r.hl,
+    lighter_rate: r.lighter,
+  }));
+}
+
+// ─── Price arbitrage history ──────────────────────────────────────────────────
+
+export interface PriceArbRecord {
+  asset: string;
+  hl_price: number;
+  lt_price: number;
+  spread_pct: number;
+  net_pct: number;
+  fetched_at: string;
+}
+
+export function savePriceArbHistory(records: PriceArbRecord[]): void {
+  if (!records.length) return;
+  const db = getDb();
+  const ins = db.prepare(
+    "INSERT INTO price_arb_history (asset, hl_price, lt_price, spread_pct, net_pct, fetched_at) VALUES (?, ?, ?, ?, ?, ?)"
+  );
+  db.transaction(() => {
+    for (const r of records) ins.run(r.asset, r.hl_price, r.lt_price, r.spread_pct, r.net_pct, r.fetched_at);
+  })();
+}
+
+export function shouldSavePriceArb(minIntervalMs = 15 * 60_000): boolean {
+  const row = getDb()
+    .prepare("SELECT MAX(fetched_at) as latest FROM price_arb_history")
+    .get() as { latest: string | null };
+  if (!row.latest) return true;
+  return Date.now() - new Date(row.latest).getTime() > minIntervalMs;
+}
+
+export interface PriceArbHistoryPoint {
+  fetched_at: string;
+  hl_price: number;
+  lt_price: number;
+  spread_pct: number;
+  net_pct: number;
+}
+
+export function getPriceArbHistory(asset: string, hoursBack: number): PriceArbHistoryPoint[] {
+  const cutoff = new Date(Date.now() - hoursBack * 3_600_000).toISOString();
+  return getDb()
+    .prepare(
+      `SELECT fetched_at, hl_price, lt_price, spread_pct, net_pct
+       FROM price_arb_history
+       WHERE asset = ? AND fetched_at >= ?
+       ORDER BY fetched_at ASC`
+    )
+    .all(asset, cutoff) as PriceArbHistoryPoint[];
 }

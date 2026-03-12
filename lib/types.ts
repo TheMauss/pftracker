@@ -1,5 +1,5 @@
 // Wallet chain types (user-facing)
-export type WalletChain = "solana" | "evm";
+export type WalletChain = "solana" | "evm" | "sui" | "bitcoin";
 
 // Internal chain identifiers (used for tokens and DeFi positions)
 export type ChainId =
@@ -10,7 +10,9 @@ export type ChainId =
   | "arbitrum"
   | "bsc"
   | "hyperliquid"
-  | "hyperevm";
+  | "hyperevm"
+  | "sui"
+  | "bitcoin";
 
 // DeFi protocol names
 export type ProtocolId =
@@ -26,10 +28,20 @@ export type ProtocolId =
   | "pendle"
   | "aave"
   | "compound"
+  | "spark"
+  | "morpho"
+  | "venus"
+  | "moonwell"
+  | "seamless"
+  | "navi"
+  | "scallop"
+  | "cetus"
   | "uniswap"
   | "gmx"
   | "lido"
-  | "rocketpool";
+  | "rocketpool"
+  | "jito"
+  | "marinade";
 
 export type PositionType =
   | "lend"

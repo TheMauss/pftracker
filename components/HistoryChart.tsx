@@ -2,167 +2,173 @@
 
 import { useState } from "react";
 import {
-  ResponsiveContainer,
-  ComposedChart,
-  Area,
-  Bar,
-  XAxis,
-  YAxis,
-  Tooltip,
-  CartesianGrid,
-  Legend,
+  ResponsiveContainer, AreaChart, Area,
+  XAxis, YAxis, Tooltip, CartesianGrid, ReferenceLine,
 } from "recharts";
 import { format, subDays } from "date-fns";
 import type { SnapshotsResponse } from "@/lib/types";
+import { usePrivacy, mask } from "@/lib/privacy";
 
-type Range = "7d" | "30d" | "90d" | "all";
+type Range = "7d" | "30d" | "90d" | "ytd" | "1y" | "all";
+type Mode  = "value" | "performance";
 
-const WALLET_COLORS = [
-  "#6366f1",
-  "#22d3ee",
-  "#f59e0b",
-  "#10b981",
-  "#f43f5e",
-  "#a855f7",
+const RANGES: { key: Range; label: string }[] = [
+  { key: "7d",  label: "7D" },
+  { key: "30d", label: "30D" },
+  { key: "90d", label: "90D" },
+  { key: "ytd", label: "YTD" },
+  { key: "1y",  label: "1R" },
+  { key: "all", label: "Vše" },
 ];
 
 interface Props {
   data: SnapshotsResponse | null;
+  /** When provided the chart is locked to this mode (no toggle shown). */
+  forceMode?: Mode;
+  /** Shared range state — pass when syncing two charts. */
+  range?: Range;
+  onRangeChange?: (r: Range) => void;
 }
 
 function fmtK(v: number) {
-  if (v >= 1000000) return `$${(v / 1000000).toFixed(1)}M`;
-  if (v >= 1000) return `$${(v / 1000).toFixed(1)}K`;
+  if (v >= 1_000_000) return `$${(v / 1_000_000).toFixed(1)}M`;
+  if (v >= 1_000) return `$${(v / 1_000).toFixed(0)}K`;
   return `$${v.toFixed(0)}`;
 }
+function fmtPct(v: number) {
+  return `${v >= 0 ? "+" : ""}${v.toFixed(2)}%`;
+}
 
-export default function HistoryChart({ data }: Props) {
-  const [range, setRange] = useState<Range>("30d");
-
-  if (!data?.history?.length) {
-    return (
-      <div className="bg-gray-900 rounded-xl border border-gray-800 p-5">
-        <h2 className="font-semibold text-white mb-4">Historie portfolia</h2>
-        <div className="h-48 flex items-center justify-center text-gray-500 text-sm">
-          Žádná historická data — první snapshot se vytvoří o půlnoci.
-          <br />
-          Lze spustit manuálně přes API: POST /api/snapshot
-        </div>
+function CustomTooltip({ active, payload, label, mode, hidden }: {
+  active?: boolean; payload?: { value: number }[]; label?: string; mode: Mode; hidden: boolean;
+}) {
+  if (!active || !payload?.length) return null;
+  const val = payload[0]?.value ?? 0;
+  const isDown = mode === "performance" && val < 0;
+  return (
+    <div className="rounded-xl px-3.5 py-3 text-xs space-y-1" style={{
+      background: "#15151a", border: "1px solid rgba(255,255,255,0.08)",
+      boxShadow: "0 16px 40px rgba(0,0,0,0.8)",
+    }}>
+      <div className="font-semibold" style={{ color: "#505050" }}>{label}</div>
+      <div className="font-bold" style={{ color: isDown ? "#ff3d5a" : "#3cffa0" }}>
+        {mode === "value" ? mask(fmtK(val), hidden) : fmtPct(val)}
       </div>
-    );
-  }
+    </div>
+  );
+}
 
-  // Filter by range
-  const cutoff =
-    range === "all"
-      ? null
-      : subDays(
-          new Date(),
-          range === "7d" ? 7 : range === "30d" ? 30 : 90
-        );
+export default function HistoryChart({ data, forceMode, range: extRange, onRangeChange }: Props) {
+  const [localRange, setLocalRange] = useState<Range>("30d");
+  const { hidden } = usePrivacy();
 
-  const filtered = data.history.filter(
-    (h) => !cutoff || new Date(h.taken_at) >= cutoff
+  const range = extRange ?? localRange;
+  const setRange = onRangeChange ?? setLocalRange;
+  const mode: Mode = forceMode ?? "value";
+
+  const empty = (
+    <div className="card rounded-2xl p-5 h-[220px] flex flex-col gap-3">
+      <div className="text-sm font-semibold" style={{ color: "#f0f0f0" }}>
+        {mode === "value" ? "Hodnota portfolia" : "Performance"}
+      </div>
+      <div className="flex-1 flex items-center justify-center text-xs" style={{ color: "#404040" }}>
+        Žádná data — snapshot se vytvoří o půlnoci.
+      </div>
+    </div>
   );
 
-  // Add daily PnL delta
-  const chartData = filtered.map((h, i) => {
-    const prev = filtered[i - 1];
-    const delta = prev ? h.total_usd - prev.total_usd : 0;
-    return {
-      date: format(new Date(h.taken_at), "d.M"),
-      total: Math.round(h.total_usd),
-      delta: Math.round(delta),
-    };
-  });
+  if (!data?.history?.length) return empty;
+
+  const now = new Date();
+  const cutoff = range === "all" ? null
+    : range === "ytd" ? new Date(now.getFullYear(), 0, 1)
+    : range === "1y"  ? subDays(now, 365)
+    : subDays(now, range === "7d" ? 7 : range === "30d" ? 30 : 90);
+  const filtered = data.history.filter((h) => !cutoff || new Date(h.taken_at) >= cutoff);
+  const baseline = filtered[0]?.total_usd ?? 1;
+
+  const chartData = filtered.map((h) => ({
+    date: format(new Date(h.taken_at), "d.M."),
+    total: Math.round(h.total_usd),
+    perf:  +((h.total_usd / baseline - 1) * 100).toFixed(3),
+  }));
+
+  const last  = chartData.at(-1);
+  const first = chartData[0];
+  const gainPct = last && first && first.total > 0 ? ((last.total / first.total) - 1) * 100 : 0;
+  const gainAbs = last && first ? last.total - first.total : 0;
+  const isUp  = gainPct >= 0;
+  const color = isUp ? "#3cffa0" : "#ff3d5a";
+
+  const dataKey = mode === "value" ? "total" : "perf";
+  const vals    = chartData.map((d) => d[dataKey] as number);
+  const vMin    = Math.min(...vals);
+  const vMax    = Math.max(...vals);
+  const pad     = Math.max((vMax - vMin) * 0.14, mode === "performance" ? 0.5 : 1);
 
   return (
-    <div className="bg-gray-900 rounded-xl border border-gray-800 p-5">
-      <div className="flex items-center justify-between mb-4">
-        <h2 className="font-semibold text-white">Historie portfolia</h2>
-        <div className="flex gap-1 text-xs">
-          {(["7d", "30d", "90d", "all"] as Range[]).map((r) => (
-            <button
-              key={r}
-              onClick={() => setRange(r)}
-              className={`px-2.5 py-1 rounded transition-colors ${
-                range === r
-                  ? "bg-indigo-600 text-white"
-                  : "text-gray-400 hover:bg-gray-800"
-              }`}
-            >
-              {r === "all" ? "Vše" : r.toUpperCase()}
-            </button>
-          ))}
-        </div>
-      </div>
-
-      <ResponsiveContainer width="100%" height={280}>
-        <ComposedChart data={chartData}>
-          <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" />
-          <XAxis
-            dataKey="date"
-            tick={{ fontSize: 11, fill: "#6b7280" }}
-            tickLine={false}
-          />
-          <YAxis
-            yAxisId="total"
-            tickFormatter={fmtK}
-            tick={{ fontSize: 11, fill: "#6b7280" }}
-            tickLine={false}
-            axisLine={false}
-          />
-          <YAxis
-            yAxisId="delta"
-            orientation="right"
-            tickFormatter={fmtK}
-            tick={{ fontSize: 11, fill: "#6b7280" }}
-            tickLine={false}
-            axisLine={false}
-          />
-          <Tooltip
-            contentStyle={{
-              backgroundColor: "#1f2937",
-              border: "1px solid #374151",
-              borderRadius: "8px",
-              color: "#f3f4f6",
-              fontSize: 12,
-            }}
-            formatter={(value, name) => {
-              const n = Number(value);
-              return [
-                name === "total"
-                  ? `$${n.toLocaleString("cs-CZ")}`
-                  : (n >= 0 ? "+" : "") + `$${Math.abs(n).toLocaleString("cs-CZ")}`,
-                name === "total" ? "Hodnota" : "Denní změna",
-              ];
-            }}
-          />
-          <Legend
-            formatter={(value) => (
-              <span className="text-xs text-gray-400">
-                {value === "total" ? "Hodnota" : "Denní změna"}
+    <div className="card rounded-2xl p-5 flex flex-col gap-3">
+      {/* Header */}
+      <div className="flex items-center justify-between">
+        <div>
+          <div className="text-xs font-semibold uppercase tracking-widest" style={{ color: "#404040" }}>
+            {mode === "value" ? "Hodnota portfolia" : "Performance"}
+          </div>
+          <div className="flex items-baseline gap-2 mt-1">
+            <span className="text-xl font-bold tabular-nums" style={{ color }}>
+              {mode === "value"
+                ? mask(fmtK(last?.total ?? 0), hidden)
+                : fmtPct(gainPct)}
+            </span>
+            {mode === "performance" && (
+              <span className="text-xs font-semibold tabular-nums" style={{ color: `${color}88` }}>
+                {gainAbs >= 0 ? "+" : "−"}{hidden ? "••••" : fmtK(Math.abs(gainAbs))}
               </span>
             )}
+          </div>
+        </div>
+
+        {/* Range selector — only shown on one chart (value), hidden on performance to avoid duplication */}
+        {mode === "value" || forceMode === undefined ? (
+          <div className="flex gap-1 p-0.5 tab-group rounded-lg">
+            {RANGES.map(({ key, label }) => (
+              <button
+                key={key}
+                onClick={() => setRange(key)}
+                className={`px-2.5 py-1 rounded-md text-xs font-medium transition-all duration-150 ${range === key ? "tab-btn-active" : "tab-btn"}`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        ) : (
+          <span className="text-xs tabular-nums" style={{ color: "#404040" }}>
+            za {range === "all" ? "vše" : range}
+          </span>
+        )}
+      </div>
+
+      <ResponsiveContainer width="100%" height={160}>
+        <AreaChart data={chartData} margin={{ top: 2, right: 0, left: -18, bottom: 0 }}>
+          <defs>
+            <linearGradient id={`grad-${mode}`} x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%"   stopColor={color} stopOpacity={0.18} />
+              <stop offset="100%" stopColor={color} stopOpacity={0} />
+            </linearGradient>
+          </defs>
+          <CartesianGrid stroke="rgba(255,255,255,0.03)" vertical={false} />
+          <XAxis dataKey="date" tick={{ fontSize: 9, fill: "#404040" }} tickLine={false} axisLine={false} interval="preserveStartEnd" />
+          <YAxis
+            tickFormatter={mode === "value" ? fmtK : (v) => `${v >= 0 ? "+" : ""}${v.toFixed(1)}%`}
+            tick={{ fontSize: 9, fill: "#404040" }} tickLine={false} axisLine={false}
+            domain={[vMin - pad, vMax + pad]}
           />
-          <Area
-            yAxisId="total"
-            type="monotone"
-            dataKey="total"
-            stroke="#6366f1"
-            fill="#6366f1"
-            fillOpacity={0.15}
-            strokeWidth={2}
-            dot={false}
-          />
-          <Bar
-            yAxisId="delta"
-            dataKey="delta"
-            fill="#22d3ee"
-            opacity={0.6}
-            radius={[2, 2, 0, 0]}
-          />
-        </ComposedChart>
+          {mode === "performance" && <ReferenceLine y={0} stroke="rgba(255,255,255,0.07)" strokeDasharray="4 3" />}
+          <Tooltip content={<CustomTooltip mode={mode} hidden={hidden} />} cursor={{ stroke: `${color}25`, strokeWidth: 1 }} />
+          <Area type="monotone" dataKey={dataKey} stroke={color} strokeWidth={1.5}
+            fill={`url(#grad-${mode})`} dot={false}
+            activeDot={{ r: 3, fill: color, stroke: "#080808", strokeWidth: 2 }} />
+        </AreaChart>
       </ResponsiveContainer>
     </div>
   );

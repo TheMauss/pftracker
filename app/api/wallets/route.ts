@@ -6,7 +6,7 @@ import {
   updateWalletLabel,
 } from "@/lib/db";
 
-const VALID_CHAINS = ["solana", "evm"] as const;
+const VALID_CHAINS = ["solana", "evm", "sui", "bitcoin"] as const;
 
 function validateAddress(address: string, chain: string): boolean {
   if (chain === "solana") {
@@ -14,6 +14,13 @@ function validateAddress(address: string, chain: string): boolean {
   }
   if (chain === "evm") {
     return /^0x[0-9a-fA-F]{40}$/.test(address);
+  }
+  if (chain === "sui") {
+    return /^0x[0-9a-fA-F]{63,64}$/.test(address);
+  }
+  if (chain === "bitcoin") {
+    // P2PKH (1...), P2SH (3...), Bech32 SegWit (bc1q...), Taproot (bc1p...)
+    return /^(bc1[ac-hj-np-z02-9]{6,87}|[13][a-km-zA-HJ-NP-Z1-9]{25,34})$/.test(address);
   }
   return false;
 }
@@ -39,7 +46,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    if (!VALID_CHAINS.includes(chain as "solana" | "evm")) {
+    if (!VALID_CHAINS.includes(chain as typeof VALID_CHAINS[number])) {
       return NextResponse.json(
         { error: `Invalid chain. Valid chains: ${VALID_CHAINS.join(", ")}` },
         { status: 400 }
@@ -53,7 +60,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const id = insertWallet(address, chain as "solana" | "evm", label);
+    const id = insertWallet(address, chain as typeof VALID_CHAINS[number], label);
     return NextResponse.json({ id, address, chain, label });
   } catch (err) {
     return NextResponse.json({ error: String(err) }, { status: 500 });

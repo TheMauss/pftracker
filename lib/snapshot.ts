@@ -6,11 +6,13 @@
 import { formatInTimeZone } from "date-fns-tz";
 import {
   getWallets,
+  getStockPositions,
   writeSnapshot,
   getSnapshotForToday,
   type SnapshotInsertData,
 } from "./db";
 import { clearPriceCache } from "./prices";
+import { fetchStockPrices } from "./stocks";
 import { fetchSolanaBalances } from "./chains/solana";
 import { fetchEvmBalances } from "./chains/evm";
 import { fetchHyperliquidBalances } from "./chains/hyperliquid";
@@ -29,6 +31,16 @@ import { fetchAavePositions } from "./defi/evm-aave";
 // Uniswap subgraph is dead (hosted service shut down), always returns $0
 // import { fetchUniswapPositions } from "./defi/evm-uniswap";
 import { fetchGmxPositions } from "./defi/evm-gmx";
+import { fetchCompoundPositions } from "./defi/evm-compound";
+import { fetchSparkPositions } from "./defi/evm-spark";
+import { fetchMorphoPositions } from "./defi/evm-morpho";
+import { fetchVenusPositions } from "./defi/evm-venus";
+import { fetchMoonwellPositions } from "./defi/evm-moonwell";
+import { fetchSeamlessPositions } from "./defi/evm-seamless";
+import { fetchSuiBalances } from "./chains/sui";
+import { fetchBitcoinBalance } from "./chains/bitcoin";
+import { fetchNaviPositions } from "./defi/sui-navi";
+import { fetchScallopPositions } from "./defi/sui-scallop";
 import type { Wallet, RawTokenBalance, RawDefiPosition } from "./types";
 
 const PRAGUE_TZ = "Europe/Prague";
@@ -136,7 +148,33 @@ export async function takeSnapshot(overwrite = false): Promise<SnapshotResult> {
     });
   }
 
-  const totalUsd = walletData.reduce((sum, w) => sum + w.total_usd, 0);
+  // ─── Add stock positions value ────────────────────────────────────────────
+  let stocksUsd = 0;
+  try {
+    const stockPositions = getStockPositions();
+    if (stockPositions.length > 0) {
+      const manualPositions = stockPositions.filter((p) => p.source === "manual");
+      const importedPositions = stockPositions.filter((p) => p.source !== "manual");
+      const tickers = [...new Set(importedPositions.map((p) => p.ticker))];
+      const quotes = tickers.length ? await fetchStockPrices(tickers) : new Map();
+
+      for (const p of stockPositions) {
+        if (p.source === "manual") {
+          stocksUsd += (p.price_usd ?? 0) * p.quantity;
+        } else {
+          const price = quotes.get(p.ticker)?.price ?? null;
+          if (price) stocksUsd += price * p.quantity;
+        }
+      }
+      // suppress unused variable warning
+      void manualPositions;
+    }
+  } catch (err) {
+    errors.push(`[stocks] fetch failed: ${err}`);
+    console.error("[snapshot] stocks fetch failed:", err);
+  }
+
+  const totalUsd = walletData.reduce((sum, w) => sum + w.total_usd, 0) + stocksUsd;
   const status = errors.length > 0 ? "partial" : "ok";
 
   const snapshotId = writeSnapshot({
@@ -158,6 +196,14 @@ const EVM_CHAINS = ["ethereum", "base", "arbitrum", "bsc"] as const;
 async function fetchChainBalances(wallet: Wallet): Promise<RawTokenBalance[]> {
   if (wallet.chain === "solana") {
     return fetchSolanaBalances(wallet.address);
+  }
+
+  if (wallet.chain === "sui") {
+    return fetchSuiBalances(wallet.address);
+  }
+
+  if (wallet.chain === "bitcoin") {
+    return fetchBitcoinBalance(wallet.address);
   }
 
   if (wallet.chain === "evm") {
@@ -203,6 +249,13 @@ async function fetchAllDefiPositions(
     }
   };
 
+  if (wallet.chain === "sui") {
+    await Promise.all([
+      fetchWithCatch("navi",    () => fetchNaviPositions(wallet.address)),
+      fetchWithCatch("scallop", () => fetchScallopPositions(wallet.address)),
+    ]);
+  }
+
   if (wallet.chain === "solana") {
     const jlpToken = tokens.find((t) => t.token_address === JLP_MINT);
     await Promise.all([
@@ -225,22 +278,32 @@ async function fetchAllDefiPositions(
   if (wallet.chain === "evm") {
     await Promise.all([
       // HyperEVM DeFi
-      fetchWithCatch("hyperlend", () => fetchHyperlendPositions(wallet.address)),
-      fetchWithCatch("felix", () => fetchFelixPositions(wallet.address)),
-      fetchWithCatch("pendle-hyperevm", () => fetchPendlePositions(wallet.address, "hyperevm")),
+      fetchWithCatch("hyperlend",      () => fetchHyperlendPositions(wallet.address)),
+      fetchWithCatch("felix",          () => fetchFelixPositions(wallet.address)),
+      fetchWithCatch("pendle-hyperevm",() => fetchPendlePositions(wallet.address, "hyperevm")),
       // Ethereum DeFi
-      fetchWithCatch("aave-eth", () => fetchAavePositions(wallet.address, "ethereum")),
+      fetchWithCatch("aave-eth",       () => fetchAavePositions(wallet.address, "ethereum")),
+      fetchWithCatch("compound-eth",   () => fetchCompoundPositions(wallet.address, "ethereum")),
+      fetchWithCatch("spark",          () => fetchSparkPositions(wallet.address)),
+      fetchWithCatch("morpho-eth",     () => fetchMorphoPositions(wallet.address, "ethereum")),
       // Uniswap subgraph is dead (hosted service shut down), always returns $0
       // fetchWithCatch("uniswap-eth", () => fetchUniswapPositions(wallet.address, "ethereum")),
-      fetchWithCatch("pendle-eth", () => fetchPendlePositions(wallet.address, "ethereum")),
+      fetchWithCatch("pendle-eth",     () => fetchPendlePositions(wallet.address, "ethereum")),
       // Arbitrum DeFi
-      fetchWithCatch("aave-arb", () => fetchAavePositions(wallet.address, "arbitrum")),
+      fetchWithCatch("aave-arb",       () => fetchAavePositions(wallet.address, "arbitrum")),
       // fetchWithCatch("uniswap-arb", () => fetchUniswapPositions(wallet.address, "arbitrum")),
-      fetchWithCatch("pendle-arb", () => fetchPendlePositions(wallet.address, "arbitrum")),
-      fetchWithCatch("gmx", () => fetchGmxPositions(wallet.address)),
+      fetchWithCatch("compound-arb",   () => fetchCompoundPositions(wallet.address, "arbitrum")),
+      fetchWithCatch("pendle-arb",     () => fetchPendlePositions(wallet.address, "arbitrum")),
+      fetchWithCatch("gmx",            () => fetchGmxPositions(wallet.address)),
       // Base DeFi
-      fetchWithCatch("aave-base", () => fetchAavePositions(wallet.address, "base")),
+      fetchWithCatch("aave-base",      () => fetchAavePositions(wallet.address, "base")),
+      fetchWithCatch("compound-base",  () => fetchCompoundPositions(wallet.address, "base")),
+      fetchWithCatch("morpho-base",    () => fetchMorphoPositions(wallet.address, "base")),
+      fetchWithCatch("moonwell",       () => fetchMoonwellPositions(wallet.address)),
+      fetchWithCatch("seamless",       () => fetchSeamlessPositions(wallet.address)),
       // fetchWithCatch("uniswap-base", () => fetchUniswapPositions(wallet.address, "base")),
+      // BSC DeFi
+      fetchWithCatch("venus",          () => fetchVenusPositions(wallet.address)),
     ]);
   }
 

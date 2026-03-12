@@ -40,7 +40,11 @@ const FELIX_BRANCHES: Array<{
 ];
 
 const TROVE_MANAGER_ABI = parseAbi([
-  "function getLatestTroveData(uint256 troveId) view returns (uint256 entireDebt, uint256 entireColl, uint256 redistributionDebtGain, uint256 accruedInterest, uint256 recordedDebt, uint256 annualInterestRate, uint256 weightedRecordedDebt, uint256 accruedBatchManagementFee, uint256 lastInterestRateAdjTime)",
+  // Liquity V2 LatestTroveData struct order (confirmed against Felix WHYPE on-chain):
+  // [0] entireDebt, [1] entireColl, [2] redistBoldDebtGain, [3] redistCollGain,
+  // [4] accruedInterest, [5] recordedDebt, [6] annualInterestRate,
+  // [7] weightedRecordedDebt, [8] accruedBatchManagementFee, [9] lastInterestRateAdjTime
+  "function getLatestTroveData(uint256 troveId) view returns (uint256 entireDebt, uint256 entireColl, uint256 redistBoldDebtGain, uint256 redistCollGain, uint256 accruedInterest, uint256 recordedDebt, uint256 annualInterestRate, uint256 weightedRecordedDebt, uint256 accruedBatchManagementFee, uint256 lastInterestRateAdjTime)",
 ]);
 
 const NFT_ABI = parseAbi([
@@ -198,8 +202,12 @@ export async function fetchFelixPositions(
         const data = entry.result as bigint[];
         const branch = troveCalls[i]._branch;
 
-        const entireDebt = Number(data[0]) / 1e18; // feUSD (18 decimals)
-        const entireColl = Number(data[1]) / 1e18; // collateral (18 decimals)
+        const entireDebt       = Number(data[0]) / 1e18; // feUSD (18 decimals)
+        const entireColl       = Number(data[1]) / 1e18; // collateral (18 decimals)
+        // annualInterestRate is at index 6 (WAD fraction, e.g. 0.071 = 7.1%)
+        // Use BigInt arithmetic to avoid precision loss (rates like 7% = 7e16 > MAX_SAFE_INTEGER)
+        const rateWad = data[6] as bigint;
+        const annualInterestRate = Number(rateWad * 10000n / 10n ** 18n) / 100; // WAD → %
 
         if (entireColl < 0.000001 && entireDebt < 0.01) continue;
 
@@ -235,7 +243,7 @@ export async function fetchFelixPositions(
             price_usd: 1.0,
             value_usd: entireDebt,
             is_debt: true,
-            apy: null,
+            apy: annualInterestRate > 0 ? -annualInterestRate : null,
             extra_data: { type: "trove_debt", branch: branch.name },
           });
         }

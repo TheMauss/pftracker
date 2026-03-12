@@ -12,6 +12,7 @@ const CHAIN_ID = 999;
 
 const PROTOCOL_DATA_PROVIDER = "0x5481bf8d3946E6A3168640c1D7523eB59F055a29" as const;
 const ORACLE_ADDRESS = "0xC9Fb4fbE842d57EAc1dF3e641a281827493A630e" as const;
+const POOL_ADDRESS = "0x4B2f0a27d68B40021Cd5C6A46C82ba2c27Ed12D7" as const; // Hyperlend Pool
 
 const DATA_PROVIDER_ABI = parseAbi([
   "function getAllReservesTokens() external view returns ((string symbol, address tokenAddress)[])",
@@ -21,6 +22,10 @@ const DATA_PROVIDER_ABI = parseAbi([
 
 const ERC20_ABI = parseAbi([
   "function decimals() external view returns (uint8)",
+]);
+
+const POOL_ABI = parseAbi([
+  "function getUserAccountData(address user) external view returns (uint256 totalCollateralBase, uint256 totalDebtBase, uint256 availableBorrowsBase, uint256 currentLiquidationThreshold, uint256 ltv, uint256 healthFactor)",
 ]);
 
 const ORACLE_ABI = parseAbi([
@@ -99,6 +104,7 @@ export async function fetchHyperlendPositions(
     const batch = (await client.multicall({
       contracts: [
         { address: ORACLE_ADDRESS, abi: ORACLE_ABI, functionName: "BASE_CURRENCY_UNIT" },
+        { address: POOL_ADDRESS, abi: POOL_ABI, functionName: "getUserAccountData" as const, args: [walletAddress as `0x${string}`] },
         ...reserves.map((r) => ({ address: PROTOCOL_DATA_PROVIDER, abi: DATA_PROVIDER_ABI, functionName: "getUserReserveData" as const, args: [r.tokenAddress as `0x${string}`, walletAddress as `0x${string}`] })),
         ...reserves.map((r) => ({ address: PROTOCOL_DATA_PROVIDER, abi: DATA_PROVIDER_ABI, functionName: "getReserveData" as const, args: [r.tokenAddress as `0x${string}`] })),
         ...reserves.map((r) => ({ address: r.tokenAddress as `0x${string}`, abi: ERC20_ABI, functionName: "decimals" as const })),
@@ -110,10 +116,21 @@ export async function fetchHyperlendPositions(
     const n = reserves.length;
     const baseCurrencyEntry = batch[0];
     const baseCurrencyUnit = (baseCurrencyEntry?.status === "success" ? baseCurrencyEntry.result : 10n ** 8n) as bigint ?? 10n ** 8n;
-    const userDataResults   = batch.slice(1,         1 + n);
-    const reserveDataResults = batch.slice(1 + n,    1 + 2 * n);
-    const decimalsResults   = batch.slice(1 + 2 * n, 1 + 3 * n);
-    const priceResults      = batch.slice(1 + 3 * n, 1 + 4 * n);
+    const accountDataEntry = batch[1]; // getUserAccountData result
+    const userDataResults   = batch.slice(2,         2 + n);
+    const reserveDataResults = batch.slice(2 + n,    2 + 2 * n);
+    const decimalsResults   = batch.slice(2 + 2 * n, 2 + 3 * n);
+    const priceResults      = batch.slice(2 + 3 * n, 2 + 4 * n);
+
+    // Parse health factor
+    let healthFactor: number | null = null;
+    let liquidationThresholdPct: number | null = null;
+    if (accountDataEntry?.status === "success" && accountDataEntry.result) {
+      const [, , , liqThreshRaw, , hfRaw] = accountDataEntry.result as bigint[];
+      const hfNum = Number(hfRaw) / 1e18;
+      healthFactor = hfNum > 1_000_000 ? null : +hfNum.toFixed(4);
+      liquidationThresholdPct = Number(liqThreshRaw) / 100;
+    }
 
     // Fetch HYPE price if needed
     const needsHype = reserves.some((r, i) => {
@@ -162,6 +179,7 @@ export async function fetchHyperlendPositions(
             value_usd: valueUsd,
             is_debt: false,
             apy: depositApy,
+            extra_data: healthFactor !== null ? { health_factor: healthFactor, liquidation_threshold_pct: liquidationThresholdPct } : undefined,
           });
         }
       }
@@ -181,6 +199,7 @@ export async function fetchHyperlendPositions(
             value_usd: valueUsd,
             is_debt: true,
             apy: -borrowApy,
+            extra_data: healthFactor !== null ? { health_factor: healthFactor, liquidation_threshold_pct: liquidationThresholdPct } : undefined,
           });
         }
       }

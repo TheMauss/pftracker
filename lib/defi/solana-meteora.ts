@@ -23,14 +23,17 @@ export async function fetchMeteoraPositions(
   const positions: RawDefiPosition[] = [];
 
   try {
-    // DLMM positions
-    const dlmmUrl = `${METEORA_API}/position/${walletAddress}`;
-    const res = await fetch(dlmmUrl, { headers: { Accept: "application/json" } });
+    // DLMM positions (v2 endpoint)
+    const dlmmUrl = `${METEORA_API}/position_v2/${walletAddress}`;
+    const res = await fetch(dlmmUrl, {
+      headers: { Accept: "application/json" },
+      signal: AbortSignal.timeout(15_000),
+    });
 
     if (res.ok) {
       const data = await res.json();
       const dlmmPositions: MeteoraPosition[] =
-        data?.userPositions ?? data ?? [];
+        data?.userPositions ?? data?.positions ?? (Array.isArray(data) ? data : []);
 
       for (const pos of dlmmPositions) {
         const totalUsd = pos.totalXYUsdValue ?? 0;
